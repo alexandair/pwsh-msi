@@ -1,0 +1,17 @@
+{
+  "powerShell": {
+    "version": "7.7.0",
+    "architecture": "x64",
+    "url": "https://github.com/PowerShell/PowerShell/releases/download/v7.7.0/PowerShell-7.7.0-win-x64.zip",
+    "sha256": "7c74e03b20a75b59715847439d046a6214b1863ee79b187872980f139bb4a05f"
+  },
+  "wix": {
+    "version": "3.14.1",
+    "url": "https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip",
+    "sha256": "6ac824e1642d6f7277d0ed7ea09411a508f6116ba6fae0aa5f2c7daa2ff43d31"
+  },
+  "legacyPowerShellSource": {
+    "version": "7.6.10",
+    "commit": "16ac95d24d87c61a5d8300dae2d0619db06c555c"
+  }
+}
