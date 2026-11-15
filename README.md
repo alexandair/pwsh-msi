@@ -1,23 +1,22 @@
 # Unofficial PowerShell 7 MSI
 
-This project builds an **unofficial** x64 MSI for PowerShell 7.7.0, unsigned by
-default or optionally signed with your own local certificate, Azure Key Vault
-certificate, or Microsoft Artifact Signing profile.
-It packages Microsoft's release ZIP using the MSI authoring from PowerShell
-7.6.10, adapted for this build. It is not a Microsoft-produced installer.
+This project builds an unofficial x64 MSI for PowerShell 7.7.0. Leave it
+unsigned or sign it with your own local certificate, Azure Key Vault certificate,
+or Microsoft Artifact Signing profile. It packages Microsoft's release ZIP
+using installer authoring adapted from PowerShell 7.6.10.
+Microsoft does not produce this installer.
 
 The MSI uses the original x64 stable `UpgradeCode` and installation directory.
 **Installing it is intended to replace an older official PowerShell 7 MSI**, not
-to install alongside it. Build the MSI without changing the installed version;
-test installation, upgrades, repairs, and uninstall in a disposable Windows VM
+to install alongside it. Building the MSI does not change your installed version.
+Test installation, upgrades, repairs, and uninstall in a disposable Windows VM
 before deployment.
 
 ## Choose how to build
 
-Organizations can build an MSI for their own use on a Windows machine or in
-their own GitHub repository. Signing is optional. The organization supplies
-its certificate or Azure signing configuration; this project does not issue
-production certificates.
+Build on a Windows machine or in your organization's GitHub repository.
+Signing is optional. Supply your own certificate or Azure signing configuration;
+this project does not issue production certificates.
 
 | Execution | Signing method | Where to get the MSI |
 | --- | --- | --- |
@@ -33,23 +32,22 @@ Key Vault and Artifact Signing still use Azure remotely and require network
 access and an authorized Azure identity. The scripts do not upload the finished
 MSI to GitHub. All local modes use the output filename shown below.
 
-The supplied signing workflow covers Artifact Signing only. There are no
-ready-made GitHub Actions signing workflows for a local certificate or Key
-Vault, although an organization can call `build.ps1` from its own Windows
-pipeline after configuring certificate access or Azure CLI authentication.
+The supplied signing workflow covers Artifact Signing only. For a local
+certificate or Key Vault, call `build.ps1` from your own Windows pipeline
+after configuring certificate access or Azure CLI authentication.
 
 Artifact Signing is implemented but has not been verified against the live
-service. Neither ordinary CI nor the local automated tests replace acceptance
-testing with an eligible organization's account.
+service. Test it with an eligible organization's account before relying on it.
+A passing CI run does not replace that check.
 
 ## Build
 
-On Windows, use the latest patch of **PowerShell 7.6 LTS**, the oldest
+On Windows, use the latest patch of PowerShell 7.6 LTS, the oldest
 Microsoft-supported release as of November 15, 2026, or a newer supported stable
 release. PowerShell 7.4 and 7.5 both reached end of support on November 10, 2026.
 See [Microsoft's support lifecycle](https://learn.microsoft.com/powershell/scripting/install/powershell-support-lifecycle#powershell-end-of-support-dates).
-The scripts' `#Requires -Version 7.2` is a technical compatibility floor, not a
-statement that Microsoft still supports PowerShell 7.2.
+The scripts require at least PowerShell 7.2 to run, but that version is no
+longer supported by Microsoft. Use a supported release.
 
 Every `.ps1` file includes comment-based help with examples. Read it without
 executing the script:
@@ -58,6 +56,8 @@ executing the script:
 Get-Help .\build.ps1 -Full
 Get-Help .\setup-artifact-signing.ps1 -Examples
 ```
+
+Build an unsigned MSI:
 
 ```powershell
 pwsh -NoProfile -File .\build.ps1
@@ -83,8 +83,8 @@ To verify the MSI's identity, upgrade rule, and payload without installing it:
 pwsh -NoProfile -File .\verify.ps1
 ```
 
-Verification creates and removes an administrative image; it does not exercise
-an actual install, upgrade, repair, uninstall, or remoting configuration.
+Verification creates and removes an administrative image. It does not test
+installation, upgrades, repairs, uninstall, or remoting configuration.
 
 ## Optional code signing
 
@@ -93,8 +93,8 @@ an actual install, upgrade, repair, uninstall, or remoting configuration.
 Pass `-SigningCertificate` from a PowerShell session to sign the MSI with SHA-256.
 The certificate must be currently valid, have the Code Signing enhanced key
 usage and an accessible private key, and chain to a root trusted by the build
-machine. Target machines must also trust its chain. Signing identifies you as
-the package signer; it does not make this a Microsoft-produced installer.
+machine. Target machines must also trust its chain. Your organization becomes
+the package signer, not Microsoft.
 
 Load a password-protected PFX without putting its password on the command line:
 
@@ -119,12 +119,11 @@ your certificate provider's Authenticode timestamp service:
 .\build.ps1 -SigningCertificate $certificate -TimestampServer 'http://timestamp.digicert.com' -Force
 ```
 
-There is no default timestamp service or timestamp request. For local signing,
-`-TimestampServer` requires `-SigningCertificate` and an `http://` URL:
-PowerShell's underlying Authenticode timestamp API does not support HTTPS or
-RFC 3161-only services.
-If you omit it, the MSI is signed without a timestamp and signature validity is
-limited by the signing certificate's lifetime.
+Local signing does not request a timestamp unless you supply `-TimestampServer`.
+It requires `-SigningCertificate` and an `http://` URL because PowerShell's
+Authenticode timestamp API does not support HTTPS or RFC 3161-only services.
+Without a timestamp, signature validity is limited by the signing certificate's
+lifetime.
 
 Signing and signature verification happen before the MSI is moved to `out`.
 A signing, trust, or requested timestamp failure stops the build without
@@ -144,13 +143,13 @@ Keep PFX files and passwords outside this repository; do not commit private keys
 ### Azure Key Vault certificate
 
 Use `-KeyVaultCertificateId` instead of `-SigningCertificate` to sign remotely
-with a certificate in Azure Key Vault. The private key can be non-exportable:
-the script reads the public certificate and signs through Key Vault, without
+with a certificate in Azure Key Vault. The key can be non-exportable.
+The script reads the public certificate and signs through Key Vault without
 retrieving a secret or downloading the private key.
 
 Install [Azure CLI](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli)
 and authenticate to the appropriate tenant/subscription before building.
-The script uses only that existing CLI login: it does not log in, provision
+The script uses only that existing CLI login. It does not log in, provision
 resources, create credentials, or fall back to another Azure identity. A CI
 pipeline can establish its CLI session using its own managed identity or
 federated identity before running the build.
@@ -175,11 +174,12 @@ if ($LASTEXITCODE -ne 0) { throw 'Could not resolve the Key Vault certificate.' 
 The ID must include an exact version:
 `https://<vault>.vault.azure.net/certificates/<name>/<version>`.
 The script reads and signs with that same version and verifies the resulting
-signer thumbprint against its public certificate, avoiding a certificate-renewal
-race. Local and Key Vault signing cannot be selected together.
+signer thumbprint against its public certificate. This prevents a renewal
+from changing the certificate partway through the build.
+Local and Key Vault signing cannot be selected together.
 
 For Key Vault signing, `-TimestampServer` is an optional HTTP or HTTPS
-**RFC 3161** service; both the MSI signature and timestamp digest use SHA-256.
+RFC 3161 service; both the MSI signature and timestamp digest use SHA-256.
 There is no default timestamp service. The HTTP-only legacy Authenticode
 timestamp restriction above applies only to local signing.
 
@@ -193,8 +193,8 @@ tool, distinct from Microsoft's Artifact Signing service.
 The certificate must have Code Signing enhanced key usage, be currently valid,
 and chain to a root trusted by the build and target machines. A default TLS
 certificate or an untrusted self-signed test certificate is not sufficient.
-Production certificate issuance and any required HSM protection must follow
-your CA's requirements; Key Vault storage alone does not establish public trust.
+Follow your CA's certificate issuance and HSM requirements.
+Storing a certificate in Key Vault does not make it publicly trusted.
 For certificate enrollment, see Microsoft's
 [Key Vault CSR workflow](https://learn.microsoft.com/en-us/azure/key-vault/certificates/create-certificate-signing-request).
 
@@ -205,16 +205,15 @@ the same as for local signing.
 
 ### Microsoft Artifact Signing
 
-**Implemented, but not live-service verified.** Argument construction, identity
-checks, mandatory timestamping, cleanup, and failure handling have automated
+This integration is implemented but has not been tested against the live service.
+Argument construction, identity checks, mandatory timestamping, cleanup, and
+failure handling have automated
 tests with mocked signing. An eligible organization must complete the live
-acceptance check below before relying on this integration for releases.
-The maintainer's enrollment eligibility does not determine whether an
-organization can use these scripts.
+acceptance check below before using it to distribute packages.
 
 The organization supplies an Artifact Signing account, completed identity
 validation, and a certificate profile. Assign its signing identity the
-**Artifact Signing Certificate Profile Signer** role, scoped to the intended
+Artifact Signing Certificate Profile Signer role, scoped to the intended
 profile. Public Trust and Private Trust availability depend on Microsoft's
 onboarding requirements; a private profile is not a workaround for eligibility.
 The build machine and recipients must trust the resulting chain.
@@ -222,23 +221,23 @@ The build machine and recipients must trust the resulting chain.
 For command-line builds, the script downloads pinned
 `Microsoft.Windows.SDK.BuildTools` and `Microsoft.ArtifactSigning.Client` NuGet
 archives into `cache` only when this backend is selected. Versions, URLs, and
-SHA-256 hashes are recorded in `dependencies.json`. Every use verifies the
-archives' hashes and extracts fresh copies into the temporary build directory;
-the script resolves the matching x64 SignTool and dlib paths automatically.
+SHA-256 hashes are recorded in `dependencies.json`. Each build checks the
+archives' hashes, extracts fresh copies into its temporary directory, and
+resolves the matching x64 SignTool and dlib paths.
 No PowerShell signing module, NuGet CLI, or full Windows SDK installation is
 needed.
 
 Install the x64 .NET runtime 8.0 or newer and the current x64 Visual C++ v14
 Redistributable first. The pinned client's runtime configuration allows
-roll-forward to a newer .NET major version. The script checks Windows runtime
-registration before downloading tools or building and reports missing
-prerequisites; it never installs system-wide runtimes or requires administrator
-access just to unpack tools. See Microsoft's
+roll-forward to a newer .NET major version. The script checks runtime
+registration and reports missing prerequisites before downloading tools or
+building. It does not install system-wide runtimes, and unpacking the tools
+does not require administrator access. See Microsoft's
 [Artifact Signing client prerequisites](https://learn.microsoft.com/en-us/azure/artifact-signing/how-to-signing-integrations).
 
 Authenticate Azure CLI to the intended tenant first. The generated dlib metadata
 excludes alternative credential providers and uses the existing Azure CLI
-session; the script neither logs in nor accepts client secrets.
+session. The script does not log in or accept client secrets.
 
 ```powershell
 .\build.ps1 `
@@ -248,20 +247,20 @@ session; the script neither logs in nor accepts client secrets.
     -ExpectedSignerSubject 'CN=Example Organization, O=Example Organization, C=US'
 ```
 
-Organizations that supply their own approved tools can still pass
-`-SignToolPath` and/or `-ArtifactSigningDlibPath`. Each supplied path bypasses
-the corresponding package download; use matching x64 tools and retain all
-adjacent dependency files. Runtime prerequisite checks still apply.
+To use your own approved tools, pass `-SignToolPath` and/or
+`-ArtifactSigningDlibPath`. Each supplied path bypasses the corresponding
+package download. Use matching x64 tools and keep all adjacent dependency files.
+Runtime prerequisite checks still apply.
 
-Replace the example subject with the **complete, exact certificate subject**
-for your profile, as reported by Windows `SignerCertificate.Subject`; checking
-only a friendly publisher name is insufficient. Select the endpoint for the
+Replace the example subject with the complete, exact certificate subject
+reported by Windows `SignerCertificate.Subject` for your profile.
+A friendly publisher name is not enough. Select the endpoint for the
 account's actual Azure region. Local, Key Vault, and Artifact Signing parameters
 are mutually exclusive.
 
 Artifact Signing always requires an RFC 3161 timestamp. If `-TimestampServer`
 is omitted, this backend uses `http://timestamp.acs.microsoft.com`; both digests
-are SHA-256. These defaults are specific to Artifact Signing and do not change
+are SHA-256. These defaults apply only to Artifact Signing and do not change
 local or Key Vault timestamp behavior. Signing remains inside the temporary
 build directory; signature or timestamp failures never publish an unsigned
 fallback or replace existing output, even with `-Force`.
@@ -269,8 +268,9 @@ fallback or replace existing output, even with `-Force`.
 The script requires a valid Windows signature, matching subject, Code Signing
 EKU, and timestamp. Optionally pass `-ExpectedProfileEku` with the profile's
 durable identity EKU (`1.3.6.1.4.1.311.97...`) to distinguish profiles belonging
-to the same publisher. This is recommended once known. Do not pin a leaf
-thumbprint: Artifact Signing certificates rotate daily and last about 72 hours.
+to the same publisher. Use it once you know the profile's EKU.
+Do not pin a leaf thumbprint. Artifact Signing certificates rotate daily and
+last about 72 hours.
 Deleting and recreating a profile changes its durable EKU.
 See [certificate management](https://learn.microsoft.com/en-us/azure/artifact-signing/concept-certificate-management).
 
@@ -281,30 +281,29 @@ Verify a signed MSI's identity, timestamp, and complete payload with:
 ```
 
 Add the same `-ExpectedProfileEku` if configured at signing time. Without these
-options, `verify.ps1` retains its existing payload-only behavior and accepts
+options, `verify.ps1` checks only the payload and installer properties and accepts
 unsigned MSIs.
 
 ## GitHub Actions
 
 ### Unsigned build and validation workflow
 
-`.github\workflows\build-unsigned-msi.yml` (**Build and test unsigned MSI**) builds
+`.github\workflows\build-unsigned-msi.yml` (Build and test unsigned MSI) builds
 an unsigned MSI, verifies its payload, and runs the signing and setup tests on
-Windows for pushes and pull requests. It can also be run manually. Its purpose
-is to catch regressions when code, installer authoring,
-or pinned dependencies change.
+Windows for pushes and pull requests. You can also run it manually.
+It catches regressions when code, installer authoring, or pinned dependencies
+change.
 
 CI has read-only repository access and needs no Azure account. Signing tests
 use mocks and an untrusted test certificate; setup tests mock all cloud changes.
 Neither uses an organization's production signing identity. A successful CI
-run checks the build and automated tests; it does not prove that live Azure
-authentication or Artifact Signing works,
-or that installation and upgrades work on target machines.
+run checks the build and automated tests. It does not prove that live Azure
+authentication, Artifact Signing, installation, or upgrades work.
 
 Only after verification and all tests pass does the workflow upload the MSI
-as **`powershell-msi-unsigned`**. Failed checks stop the upload. The package is
+as `powershell-msi-unsigned`. Failed checks stop the upload. The package is
 unsigned and available for evaluation or the organization's own signing
-process; it is not a production-signed release. Push and pull-request runs
+process. It is not a production-signed release. Push and pull-request runs
 produce packages from the revision under test, not necessarily the default
 branch. Pester's version is pinned in `dependencies.json`.
 
@@ -312,25 +311,23 @@ branch. Pester's version is pinned in `dependencies.json`.
 
 `.github\workflows\artifact-signing.yml` uses Microsoft's official
 [Artifact Signing action](https://github.com/azure/artifact-signing-action).
-It is **manual-only**, default-branch-only, and disabled until explicitly
-enabled. It does not run for pull requests. Actions are pinned to commit SHAs.
+It runs only when manually started on the default branch, after you enable it.
+It does not run for pull requests. Actions are pinned to commit SHAs.
 It calls `build.ps1` in unsigned mode, then uses the official action to sign.
 The action installs the `ArtifactSigning` PowerShell module and manages its
 signing tools on the runner. This is separate from local execution, which uses
 cached SignTool+dlib directly without that module.
 
-The unsigned and Artifact Signing workflows are independent.
-`artifact-signing.yml` builds its own MSI; it does not reuse the unsigned
-workflow's artifact, wait for CI, or require a successful CI run. It
-does not run the Pester suite itself. Instead, it checks the signed MSI's
-publisher, timestamp, optional profile EKU, installer identity, and payload
-before upload.
+The workflows are independent. `artifact-signing.yml` builds its own MSI
+without reusing the unsigned artifact or waiting for a successful CI run.
+It does not run Pester. Before upload, it checks the signed MSI's publisher,
+timestamp, optional profile EKU, installer identity, and payload.
 
 #### Automated local setup
 
 Run `setup-artifact-signing.ps1` locally to configure the organization's
 repository or fork. The script uses Azure CLI, GitHub CLI, and Microsoft Graph
-REST calls; Azure PowerShell and the ArtifactSigning module are not required.
+REST calls. It does not require Azure PowerShell or the ArtifactSigning module.
 Authenticate `az` and `gh` first. It does not log in, enroll an organization,
 create a signing account/profile, or complete identity validation.
 
@@ -365,46 +362,45 @@ $setup = @{
 The actual run asks for confirmation; use `-Confirm:$false` only when the
 configuration has been reviewed. Optionally supply `-ExpectedProfileEku` and/or
 `-ApplicationClientId` to use a known profile EKU or an existing Entra
-application. Otherwise, the script creates or reuses a dedicated application
-named from the GitHub repository ID, so rerunning does not create duplicates.
+application. By default, the script creates or reuses a dedicated application
+named from the GitHub repository ID. Rerunning does not create duplicates.
 It never creates a client secret. Tenant, subscription, regional endpoint, and
 account/profile names are derived from the specified Azure resource.
 
 The script first disables signing, then configures the `artifact-signing`
 environment with your reviewers, prevention of self-approval, and a policy
-allowing only the default branch. It removes other branch/tag policies in this
-dedicated environment and replaces its reviewer list, while preserving any
-existing wait timer. It verifies that GitHub actually enforces those protections
-before creating an identity. If the repository's GitHub plan cannot enforce
-them, setup fails rather than weakening
-the rules. Private repositories generally require GitHub Enterprise for
-required-reviewer protection; check your plan before provisioning.
+allowing only the default branch. It replaces the environment's reviewer list
+and removes other branch/tag policies, but keeps any existing wait timer.
+It checks that GitHub enforces those protections before creating an identity.
+If the repository's GitHub plan cannot enforce them, setup fails rather than
+weakening the rules. Private repositories generally require GitHub Enterprise
+for required-reviewer protection; check your plan before provisioning.
 
 Next it configures an Entra federated credential for issuer
 `https://token.actions.githubusercontent.com`, audience
 `api://AzureADTokenExchange`, and subject
 `repo:OWNER/REPOSITORY:environment:artifact-signing`, then assigns
-**Artifact Signing Certificate Profile Signer** at the exact profile scope.
+Artifact Signing Certificate Profile Signer at the exact profile scope.
 Existing unrelated application credentials and role assignments are not
-removed; reusing an application does not restrict any permissions it already
-has. See Microsoft's
+removed. Reusing an application leaves its existing permissions in place.
+See Microsoft's
 [OIDC configuration](https://github.com/azure/artifact-signing-action/blob/main/docs/OIDC.md).
 
-Finally, it writes and verifies the environment variables below, rechecks the
+It then writes and verifies the environment variables below, rechecks the
 protections, and enables the repository variable `ENABLE_ARTIFACT_SIGNING`.
 That flag stays at repository scope because the workflow checks it before
 entering its environment. An omitted profile EKU clears that optional variable.
-On configuration failure after changes begin, the script attempts to disable signing and
-reports any failure to do so. Created identities and permissions are retained
-for a rerun, not silently deleted. Azure permission propagation can require
-waiting before rerunning.
+If configuration fails after changes begin, the script tries to disable signing
+and reports any failure to do so. It keeps created identities and permissions
+for a rerun. You may need to wait for Azure permissions to propagate before
+rerunning.
 
 Add `-Dispatch` to start the workflow on the default branch after setup. A
-designated reviewer must still approve it; the script does not bypass approval.
-Dispatch failure does not undo a successfully verified configuration. Do not
+designated reviewer must still approve it. The script does not bypass approval.
+If dispatch fails, the verified configuration stays enabled. Do not
 run setup concurrently or while signing jobs are running.
-Successful configuration is not proof of successful live signing. Live setup
-has not been exercised by the maintainer; setup tests mock all cloud operations.
+Successful setup does not prove that signing works. The maintainer has not
+run live setup; its tests mock all cloud operations.
 
 | Environment variable | Value |
 | --- | --- |
@@ -420,22 +416,22 @@ has not been exercised by the maintainer; setup tests mock all cloud operations.
 These are configuration identifiers, not credentials. The signing job receives
 only `contents: read` and `id-token: write` GitHub permissions. Azure login
 exchanges the GitHub OIDC token for an Azure session; signing excludes other
-Azure credential providers. This implementation targets Azure public cloud.
+Azure credential providers. The workflow supports Azure public cloud.
 
 The workflow builds into staging, signs only that MSI with SHA-256 and
 Microsoft's RFC 3161 timestamp service, and verifies its expected signer,
 optional profile EKU, timestamp, installer identity, and payload. Only then is
-it moved to `out` and uploaded as **`powershell-msi-signed`**. There is no
-unsigned upload or error fallback; failed verification stops publication.
+it moved to `out` and uploaded as `powershell-msi-signed`.
+Failed verification stops publication. No unsigned fallback is uploaded.
 The post-signing SHA-256 is written to the run log.
 
-**Live acceptance is still required.** In an eligible organization's configured
-environment, run the workflow, download the artifact, and independently check
+Before distributing signed packages, run the workflow in an eligible
+organization's configured environment. Download the artifact and check
 `Get-AuthenticodeSignature` on a trusted Windows machine. Confirm `Valid`,
 the intended subject/profile EKU, a populated `TimeStamperCertificate`, and the
-logged SHA-256. Confirm the run's full payload verification succeeded. Neither
-the Artifact Signing service call nor a hosted GitHub run has been exercised
-by the maintainer; local CI-equivalent checks are not a substitute.
+logged SHA-256. Confirm the run's full payload verification succeeded.
+The maintainer has not exercised the live Artifact Signing service or its
+GitHub signing workflow. Local CI-equivalent checks do not replace this live test.
 
 ### Downloads, releases, and privacy
 
@@ -447,24 +443,22 @@ and download the appropriate package from its **Artifacts** section:
 | Build and test unsigned MSI | `powershell-msi-unsigned` | Unsigned |
 | Build and sign with Artifact Signing | `powershell-msi-signed` | Signed and timestamped |
 
-Extract the downloaded archive to get the MSI. The signing workflow uploads
-only its verified signed result, never its unsigned staging file or an unsigned
-fallback. The unsigned package is produced by the separate build-and-test
-workflow.
+Extract the downloaded archive to get the MSI. The build-and-test workflow
+provides the unsigned package; the signing workflow provides only its verified
+signed package.
 
-Neither workflow creates a GitHub Release or attaches release assets. The
-intended model is for an organization to build, sign, and collect its own MSI,
-then distribute it through its internal channels. There is no public release
-publishing step. Workflow artifacts have limited retention, controlled by
-repository and organization settings; copy packages to your approved storage
-if you need to keep them longer.
+Neither workflow creates a GitHub Release or attaches release assets.
+Your organization downloads its MSI and distributes it through its own
+channels. Workflow artifacts have limited retention, controlled by repository
+and organization settings. Copy packages to your approved storage if you need
+to keep them longer.
 
-Skipping GitHub Releases does **not** make a package confidential. Workflow
-artifacts follow GitHub's repository access rules; artifacts in a public
-repository should not be treated as private. Use a private repository and
+Skipping GitHub Releases does not make a package confidential.
+Workflow artifacts follow GitHub's repository access rules. Do not treat
+artifacts in a public repository as private. Use a private repository and
 appropriate access controls for internal packages. GitHub Releases in a
-private repository are private too, so releases are an organizational
-distribution choice, not inherently a public-sharing mechanism.
+private repository are private too. Whether to use releases is a distribution
+choice, not a privacy control.
 
 ## Installation and servicing
 
@@ -476,12 +470,11 @@ msiexec.exe /i .\out\PowerShell-7.7.0-win-x64-unofficial.msi /l*v .\powershell-m
 
 The legacy installer options for PATH, the event manifest, remoting, telemetry,
 and Explorer context menus are retained. The manifest and remoting custom
-actions now fail the installation if their processes fail, rather than ignoring
-those failures.
+actions fail the installation if their processes fail.
 
 **Microsoft Update does not service this unofficial MSI.** Rebuild and deploy
 new packages yourself. For new installations, the obsolete `USE_MU=1` and
-`ENABLE_MU=1` properties are rejected rather than silently suggesting updates.
+`ENABLE_MU=1` properties are rejected.
 Review the supported OS versions and test any required installer options before
 deployment.
 
