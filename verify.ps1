@@ -1,8 +1,81 @@
 #Requires -Version 7.2
 
-[CmdletBinding()]
+<#
+.SYNOPSIS
+Verifies the unofficial MSI's identity and payload, optionally its signature.
+
+.DESCRIPTION
+Checks installer identity, x64 architecture, the legacy upgrade rule, update
+restrictions, and payload against the hash-verified PowerShell ZIP in cache.
+Creates and removes a temporary administrative image without installing the
+product. Requires the cached ZIP and matching dependencies.json from the build.
+
+Payload-only verification accepts unsigned MSIs. Supplying ExpectedSignerSubject
+also requires a valid Windows signature, the exact subject, Code Signing EKU,
+and a timestamp. ExpectedProfileEku adds a durable profile identity check.
+
+.PARAMETER MsiPath
+MSI to verify. Defaults to out\PowerShell-<version>-win-x64-unofficial.msi
+relative to this repository, using the version in dependencies.json.
+
+.PARAMETER ExpectedSignerSubject
+Complete, exact Windows certificate subject. Selects signed verification;
+the signer chain must be trusted by the verification machine.
+
+.PARAMETER ExpectedProfileEku
+Optional durable Artifact Signing profile identity OID beginning with
+1.3.6.1.4.1.311.97. Requires ExpectedSignerSubject.
+
+.EXAMPLE
+pwsh -NoProfile -File .\verify.ps1
+
+Checks the default output's identity and full payload. Does not require signing.
+
+.EXAMPLE
+.\verify.ps1 -MsiPath 'C:\Packages\organization-powershell.msi'
+
+Checks a package at another location against this build's cached payload.
+
+.EXAMPLE
+.\verify.ps1 -ExpectedSignerSubject 'CN=Example Organization, O=Example Organization, C=US'
+
+Checks the default output's signature, signer, timestamp, identity, and payload.
+
+.EXAMPLE
+$verification = @{
+    MsiPath = 'C:\Packages\organization-powershell.msi'
+    ExpectedSignerSubject = 'CN=Example Organization, O=Example Organization, C=US'
+    ExpectedProfileEku = '1.3.6.1.4.1.311.97.123.456'
+}
+.\verify.ps1 @verification
+
+Also checks a durable profile EKU. Replace the subject and example OID with
+the actual values for your organization's profile.
+
+.NOTES
+Requires Windows and the build's cached PowerShell ZIP.
+This does not test installation, upgrades, repairs, uninstall, or remoting.
+Use a separate pwsh process when the caller needs to move the MSI immediately
+after verification; Windows Installer COM objects can retain file handles.
+
+.LINK
+.\README.md
+
+.LINK
+.\build.ps1
+#>
+
+[CmdletBinding(DefaultParameterSetName = 'Payload')]
 param(
-    [string] $MsiPath
+    [string] $MsiPath,
+
+    [Parameter(Mandatory, ParameterSetName = 'Signed')]
+    [ValidateNotNullOrEmpty()]
+    [string] $ExpectedSignerSubject,
+
+    [Parameter(ParameterSetName = 'Signed')]
+    [ValidatePattern('^1\.3\.6\.1\.4\.1\.311\.97\.\d+(\.\d+)*$')]
+    [string] $ExpectedProfileEku
 )
 
 Set-StrictMode -Version Latest
@@ -18,6 +91,12 @@ if (-not $MsiPath) {
     $MsiPath = Join-Path $PSScriptRoot "out\PowerShell-$version-win-x64-unofficial.msi"
 }
 $msi = (Resolve-Path -LiteralPath $MsiPath).ProviderPath
+if ($PSCmdlet.ParameterSetName -eq 'Signed') {
+    . (Join-Path $PSScriptRoot 'signing.ps1')
+    Assert-MsiSignature -Path $msi -ExpectedSignerSubject $ExpectedSignerSubject `
+        -ExpectedProfileEku $ExpectedProfileEku -RequireTimestamp
+    Write-Host 'MSI signature, expected signer, and timestamp verified.'
+}
 $zip = Join-Path $PSScriptRoot "cache\PowerShell-$version-win-x64.zip"
 if ((Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash -ne $dependencies.powerShell.sha256) {
     throw "The cached PowerShell ZIP does not match the pinned SHA-256: $zip"

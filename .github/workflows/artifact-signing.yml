@@ -1,0 +1,118 @@
+name: Build and sign with Artifact Signing
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sign:
+    if: >-
+      vars.ENABLE_ARTIFACT_SIGNING == 'true' &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: windows-2022
+    timeout-minutes: 30
+    environment: artifact-signing
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      ARTIFACT_SIGNING_ENDPOINT: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+      ARTIFACT_SIGNING_ACCOUNT_NAME: ${{ vars.ARTIFACT_SIGNING_ACCOUNT_NAME }}
+      ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME: ${{ vars.ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME }}
+      EXPECTED_SIGNER_SUBJECT: ${{ vars.EXPECTED_SIGNER_SUBJECT }}
+      EXPECTED_PROFILE_EKU: ${{ vars.EXPECTED_PROFILE_EKU }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Check signing configuration
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($name in @(
+              'AZURE_CLIENT_ID', 'AZURE_TENANT_ID', 'AZURE_SUBSCRIPTION_ID',
+              'ARTIFACT_SIGNING_ENDPOINT', 'ARTIFACT_SIGNING_ACCOUNT_NAME',
+              'ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME', 'EXPECTED_SIGNER_SUBJECT'
+          )) {
+              if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+                  throw "Configure the $name variable in the protected artifact-signing environment."
+              }
+          }
+
+      - name: Build unsigned MSI into staging
+        id: build
+        run: |
+          $ErrorActionPreference = 'Stop'
+          .\build.ps1
+          $dependencies = Get-Content .\dependencies.json -Raw | ConvertFrom-Json
+          $name = "PowerShell-$($dependencies.powerShell.version)-win-x64-unofficial.msi"
+          $final = Join-Path $PWD "out\$name"
+          $staging = Join-Path $PWD '.work\artifact-signing'
+          New-Item -ItemType Directory -Path $staging | Out-Null
+          $staged = Join-Path $staging $name
+          Move-Item -LiteralPath $final -Destination $staged
+          "staged_msi=$staged" >> $env:GITHUB_OUTPUT
+          "final_msi=$final" >> $env:GITHUB_OUTPUT
+
+      - name: Authenticate to Azure using OIDC
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign staged MSI
+        uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2
+        with:
+          endpoint: ${{ env.ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ env.ARTIFACT_SIGNING_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ env.ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME }}
+          files: ${{ steps.build.outputs.staged_msi }}
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+          exclude-environment-credential: true
+          exclude-workload-identity-credential: true
+          exclude-managed-identity-credential: true
+          exclude-shared-token-cache-credential: true
+          exclude-visual-studio-credential: true
+          exclude-visual-studio-code-credential: true
+          exclude-azure-cli-credential: false
+          exclude-azure-powershell-credential: true
+          exclude-azure-developer-cli-credential: true
+          exclude-interactive-browser-credential: true
+
+      - name: Verify signed MSI before publication
+        env:
+          STAGED_MSI: ${{ steps.build.outputs.staged_msi }}
+          FINAL_MSI: ${{ steps.build.outputs.final_msi }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $verification = @{
+              MsiPath = $env:STAGED_MSI
+              ExpectedSignerSubject = $env:EXPECTED_SIGNER_SUBJECT
+          }
+          if ($env:EXPECTED_PROFILE_EKU) {
+              $verification.ExpectedProfileEku = $env:EXPECTED_PROFILE_EKU
+          }
+          # A child process releases Windows Installer's file handles before moving the MSI.
+          & (Get-Command pwsh).Source -NoProfile -File .\verify.ps1 @verification
+          if ($LASTEXITCODE -ne 0) { throw 'Signed MSI verification failed; nothing will be published.' }
+          Move-Item -LiteralPath $env:STAGED_MSI -Destination $env:FINAL_MSI
+          $hash = (Get-FileHash -LiteralPath $env:FINAL_MSI -Algorithm SHA256).Hash
+          Write-Host "Signed MSI SHA-256: $hash"
+
+      - name: Upload verified signed MSI
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: powershell-msi-signed
+          path: ${{ steps.build.outputs.final_msi }}
+          if-no-files-found: error

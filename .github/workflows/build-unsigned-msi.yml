@@ -1,0 +1,60 @@
+name: Build and test unsigned MSI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Build unsigned MSI
+        id: build
+        run: |
+          $ErrorActionPreference = 'Stop'
+          .\build.ps1
+          $dependencies = Get-Content .\dependencies.json -Raw | ConvertFrom-Json
+          $msi = Join-Path $PWD "out\PowerShell-$($dependencies.powerShell.version)-win-x64-unofficial.msi"
+          "msi_path=$msi" >> $env:GITHUB_OUTPUT
+
+      - name: Verify payload
+        run: .\verify.ps1
+
+      - name: Run signing and setup tests without Azure credentials
+        env:
+          MSI_PATH: ${{ steps.build.outputs.msi_path }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dependencies = Get-Content .\dependencies.json -Raw | ConvertFrom-Json
+          $pesterVersion = $dependencies.testing.pesterVersion
+          if (-not (Get-Module -ListAvailable Pester | Where-Object Version -EQ $pesterVersion)) {
+              Install-Module Pester -RequiredVersion $pesterVersion -Scope CurrentUser -Force
+          }
+          Import-Module Pester -RequiredVersion $pesterVersion
+          $containers = @(
+              New-PesterContainer -Path .\tests\build.Tests.ps1 -Data @{ IntegrationMsiPath = $env:MSI_PATH }
+              New-PesterContainer -Path .\tests\setup.Tests.ps1
+          )
+          $result = Invoke-Pester -Container $containers -Output Detailed -PassThru
+          if ($result.Result -ne 'Passed' -or $result.SkippedCount -gt 0) {
+              throw 'The signing and setup test suite did not fully pass.'
+          }
+
+      - name: Upload tested unsigned MSI
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: powershell-msi-unsigned
+          path: ${{ steps.build.outputs.msi_path }}
+          if-no-files-found: error
