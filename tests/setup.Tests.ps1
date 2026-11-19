@@ -46,6 +46,38 @@ BeforeAll {
     }, $false)) {
         . ([scriptblock]::Create($function.Extent.Text))
     }
+
+    $caKey = [Security.Cryptography.RSA]::Create(2048)
+    $caRequest = [Security.Cryptography.X509Certificates.CertificateRequest]::new(
+        'CN=Setup test root', $caKey, [Security.Cryptography.HashAlgorithmName]::SHA256,
+        [Security.Cryptography.RSASignaturePadding]::Pkcs1
+    )
+    $caRequest.CertificateExtensions.Add(
+        [Security.Cryptography.X509Certificates.X509BasicConstraintsExtension]::new($true, $false, 0, $true)
+    )
+    $setupRootCa = $caRequest.CreateSelfSigned(
+        [DateTimeOffset]::Now.AddMinutes(-5), [DateTimeOffset]::Now.AddDays(1)
+    )
+    $setupRootPath = Join-Path $TestDrive 'approved-root.cer'
+    [IO.File]::WriteAllBytes($setupRootPath, $setupRootCa.RawData)
+    $intermediateRequest = [Security.Cryptography.X509Certificates.CertificateRequest]::new(
+        'CN=Setup test intermediate', $caKey, [Security.Cryptography.HashAlgorithmName]::SHA256,
+        [Security.Cryptography.RSASignaturePadding]::Pkcs1
+    )
+    $intermediateRequest.CertificateExtensions.Add(
+        [Security.Cryptography.X509Certificates.X509BasicConstraintsExtension]::new($true, $false, 0, $true)
+    )
+    $setupIntermediateCa = $intermediateRequest.Create(
+        $setupRootCa, [DateTimeOffset]::Now.AddMinutes(-1), [DateTimeOffset]::Now.AddHours(1), [byte[]] @(4, 5, 6)
+    )
+    $setupIntermediatePath = Join-Path $TestDrive 'approved-intermediate.cer'
+    [IO.File]::WriteAllBytes($setupIntermediatePath, $setupIntermediateCa.RawData)
+}
+
+AfterAll {
+    $setupIntermediateCa.Dispose()
+    $setupRootCa.Dispose()
+    $caKey.Dispose()
 }
 
 Describe 'Artifact Signing setup orchestration' {
@@ -76,6 +108,7 @@ Describe 'Artifact Signing setup orchestration' {
         $script:existingEnvironments = @()
         $script:configuredWaitTimer = 0
         $script:ignoreWaitTimer = $false
+        $script:profileType = 'PublicTrust'
         Mock Get-Command {}
         Mock Invoke-NativeTool {
             if ($Tool -eq 'az' -and $ToolArguments[1] -eq 'get-access-token') {
@@ -194,7 +227,7 @@ Describe 'Artifact Signing setup orchestration' {
             if ($Arguments[0] -eq 'resource') {
                 $id = $Arguments[3]
                 if ($id -like '*certificateProfiles*') {
-                    return [pscustomobject] @{ id = $id; properties = [pscustomobject] @{ profileType = 'PublicTrust' } }
+                    return [pscustomobject] @{ id = $id; properties = [pscustomobject] @{ profileType = $script:profileType } }
                 }
                 return [pscustomobject] @{ properties = [pscustomobject] @{ accountUri = 'https://neu.codesigning.azure.net/' } }
             }
@@ -246,6 +279,50 @@ Describe 'Artifact Signing setup orchestration' {
         Should -Invoke Invoke-SetupGraph -Times 1 -Exactly -ParameterFilter { $Path -eq 'applications' -and $Method -eq 'POST' }
         Should -Invoke Invoke-SetupGraph -Times 1 -Exactly -ParameterFilter { $Path -like '*federatedIdentityCredentials' -and $Method -eq 'POST' }
         Should -Invoke Invoke-SetupAzure -Times 1 -Exactly -ParameterFilter { $Arguments[0] -eq 'role' -and $Arguments[2] -eq 'create' }
+    }
+
+    It 'requires an approved root for Private Trust before making remote changes' {
+        $script:profileType = 'PrivateTrust'
+
+        { Invoke-ArtifactSigningSetup @setup } | Should -Throw '*PrivateTrust requires -TrustedRootCertificatePath*'
+
+        Should -Invoke Invoke-SetupGitHub -Times 0 -ParameterFilter { $Method -in 'PUT', 'POST', 'PATCH', 'DELETE' }
+        Should -Invoke Invoke-SetupGraph -Times 0
+    }
+
+    It 'configures approved Private Trust CAs without installing them locally' {
+        $script:profileType = 'PrivateTrust'
+        Mock Import-Certificate { throw 'Setup must not change local trust.' }
+
+        Invoke-ArtifactSigningSetup @setup -TrustedRootCertificatePath $setupRootPath `
+            -IntermediateCertificatePath @($setupIntermediatePath, $setupIntermediatePath)
+
+        $script:environmentVariables.ARTIFACT_SIGNING_PROFILE_TYPE | Should -BeExactly 'PrivateTrust'
+        $script:environmentVariables.ARTIFACT_SIGNING_ROOT_CERTIFICATE_BASE64 |
+            Should -BeExactly ([Convert]::ToBase64String($setupRootCa.RawData))
+        $encodedIntermediate = [Convert]::ToBase64String($setupIntermediateCa.RawData)
+        $script:environmentVariables.ARTIFACT_SIGNING_INTERMEDIATE_CERTIFICATES_BASE64 |
+            Should -BeExactly "$encodedIntermediate`n$encodedIntermediate"
+        Should -Invoke Import-Certificate -Times 0
+    }
+
+    It 'clears previously configured CAs when rerun for Public Trust without CA paths' {
+        Invoke-ArtifactSigningSetup @setup -TrustedRootCertificatePath $setupRootPath
+        $script:environmentVariables.ARTIFACT_SIGNING_INTERMEDIATE_CERTIFICATES_BASE64 = 'previous value'
+
+        Invoke-ArtifactSigningSetup @setup
+
+        $script:environmentVariables.ARTIFACT_SIGNING_PROFILE_TYPE | Should -BeExactly 'PublicTrust'
+        $script:environmentVariables.ARTIFACT_SIGNING_ROOT_CERTIFICATE_BASE64 | Should -BeNullOrEmpty
+        $script:environmentVariables.ARTIFACT_SIGNING_INTERMEDIATE_CERTIFICATES_BASE64 | Should -BeNullOrEmpty
+    }
+
+    It 'validates CA files even with WhatIf without making remote changes' {
+        { Invoke-ArtifactSigningSetup @setup -TrustedRootCertificatePath $setupRootPath `
+            -IntermediateCertificatePath $setupRootPath -WhatIf } | Should -Throw '*intermediate CA is a root*'
+
+        Should -Invoke Invoke-SetupGitHub -Times 0 -ParameterFilter { $Method -in 'PUT', 'POST', 'PATCH', 'DELETE' }
+        Should -Invoke Invoke-SetupGraph -Times 0
     }
 
     It 'makes no remote changes with WhatIf' {

@@ -16,6 +16,7 @@ do not publish an unsigned fallback or replace existing output.
 
 .PARAMETER Force
 Replaces an existing output MSI only after the build and any signing succeed.
+Does not bypass signature verification, certificate trust, or file locks.
 
 .PARAMETER SigningCertificate
 Local X509Certificate2 with an accessible private key, Code Signing EKU,
@@ -111,6 +112,9 @@ Artifact Signing also requires Azure CLI, x64 .NET runtime 8.0 or newer, and the
 x64 Visual C++ v14 Redistributable. The script does not log in, create signing
 resources, or install system-wide runtimes. Artifact Signing needs live
 acceptance testing with an eligible organization's account.
+The build account must already trust the profile's root CA and have any
+required intermediate certificates. An untrusted signature stops publication
+even if the remote signing service reports success. Do not bypass verification.
 This MSI is not Microsoft-produced and does not receive Microsoft Update
 servicing. Test installation and upgrades in a disposable Windows VM.
 
@@ -236,6 +240,17 @@ function Assert-CodeSigningCertificate {
     if (-not $eku -or '1.3.6.1.5.5.7.3.3' -notin $eku.EnhancedKeyUsages.Value) {
         throw 'The signing certificate must have the Code Signing enhanced key usage.'
     }
+}
+
+function Publish-Msi {
+    param(
+        [Parameter(Mandatory)] [string] $Path,
+        [Parameter(Mandatory)] [string] $Destination,
+        [switch] $Force
+    )
+
+    # Use explicit overwrite semantics without deleting the previous output first.
+    [IO.File]::Move($Path, $Destination, [bool] $Force)
 }
 
 function Invoke-MsiSigning {
@@ -573,7 +588,7 @@ try {
             -SignToolPath $SignToolPath -DlibPath $ArtifactSigningDlibPath -TimestampServer $TimestampServer
     }
 
-    Move-Item -LiteralPath $temporaryMsi -Destination $output -Force:$Force
+    Publish-Msi -Path $temporaryMsi -Destination $output -Force:$Force
     $hash = (Get-FileHash -LiteralPath $output -Algorithm SHA256).Hash
     Write-Host "Created $output"
     Write-Host "SHA-256: $hash"

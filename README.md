@@ -36,9 +36,10 @@ The supplied signing workflow covers Artifact Signing only. For a local
 certificate or Key Vault, call `build.ps1` from your own Windows pipeline
 after configuring certificate access or Azure CLI authentication.
 
-Artifact Signing is implemented but has not been verified against the live
-service. Test it with an eligible organization's account before relying on it.
-A passing CI run does not replace that check.
+A community tester has reported successful local Artifact Signing after
+installing the profile's root CA. The maintainer has not independently repeated
+that live test or run the GitHub signing workflow. Test your own configuration
+before relying on it; a passing CI run does not replace that check.
 
 ## Build
 
@@ -66,7 +67,8 @@ pwsh -NoProfile -File .\build.ps1
 The script downloads the official PowerShell ZIP and the portable WiX 3.14.1
 tools into `cache`, verifies their pinned SHA-256 hashes, and builds
 `out\PowerShell-7.7.0-win-x64-unofficial.msi`. Use `-Force` to replace an
-existing output. The ZIP hash comes from the
+existing output after the build and any signature checks succeed. It does not
+bypass certificate trust checks or file locks. The ZIP hash comes from the
 [PowerShell 7.7.0 release](https://github.com/PowerShell/PowerShell/releases/tag/v7.7.0);
 the WiX hash is also recorded in
 [Microsoft PowerToys' WiX setup](https://github.com/microsoft/PowerToys/blob/204427d127cb098fa1624f170ed6cee13a0633cc/.pipelines/installWiX.ps1).
@@ -205,18 +207,133 @@ the same as for local signing.
 
 ### Microsoft Artifact Signing
 
-This integration is implemented but has not been tested against the live service.
-Argument construction, identity checks, mandatory timestamping, cleanup, and
-failure handling have automated
-tests with mocked signing. An eligible organization must complete the live
-acceptance check below before using it to distribute packages.
+Local signing has been reported working against the live service by a community
+tester. The maintainer has not independently repeated that test. Automated
+tests cover argument construction, identity checks, mandatory timestamping,
+cleanup, and failure handling with mocked signing. Complete the live acceptance
+check below with your own profile before distributing packages.
 
 The organization supplies an Artifact Signing account, completed identity
-validation, and a certificate profile. Assign its signing identity the
-Artifact Signing Certificate Profile Signer role, scoped to the intended
+validation, and a Public Trust or Private Trust code-signing certificate profile.
+CI Policy and VBS enclave profiles are not MSI-signing profiles.
+Assign its signing identity the Artifact Signing Certificate Profile Signer role, scoped to the intended
 profile. Public Trust and Private Trust availability depend on Microsoft's
 onboarding requirements; a private profile is not a workaround for eligibility.
 The build machine and recipients must trust the resulting chain.
+
+#### Trust the profile's CA before building
+
+**The Windows account running the build must trust the profile's root CA.**
+The certificate chain must also be complete, including any required intermediate
+CAs. Azure signing permission alone is not enough.
+
+| Machine | Public Trust | Private Trust |
+| --- | --- | --- |
+| Local Windows | Normally trusted through Windows updates; install missing CA certificates if needed | Configure CA trust explicitly |
+| GitHub-hosted Windows runner | Normally already trusted | Supply approved CA certificates to setup; the workflow imports them on the runner |
+
+Installing a CA locally does not configure a GitHub-hosted runner.
+Test profiles can also need explicit trust setup.
+
+Obtain the correct root and intermediate certificates from your organization's
+PKI administrator or Microsoft's documentation for the profile. Verify their
+fingerprints through a trusted source before installing them. Put the root in
+Trusted Root Certification Authorities and intermediates in Intermediate
+Certification Authorities, using the build account's stores or an
+organization-managed machine-wide deployment. Recipients need the same trust.
+Do not install the signer's leaf certificate as a trusted root.
+
+To download the root and certificate chain for your Artifact Signing profile,
+use the `Az.ArtifactSigning` Azure PowerShell module. This is separate from the
+`ArtifactSigning` signing module. It is needed only for these download commands,
+not for `build.ps1`.
+
+```powershell
+Install-Module Az.ArtifactSigning -Scope CurrentUser
+New-Item -ItemType Directory -Path 'C:\Signing' -Force | Out-Null
+
+# Azure PowerShell authentication is separate from az login.
+Connect-AzAccount -Tenant '<TENANT_ID>' -Subscription '<SUBSCRIPTION_ID>'
+
+$profileParameters = @{
+    AccountName = '<YOUR_ACCOUNT>'
+    ProfileName = '<YOUR_PROFILE>'
+    EndpointUrl = '<YOUR_REGIONAL_ENDPOINT>'
+}
+
+Get-AzArtifactSigningCertificateRoot @profileParameters -Destination 'C:\Signing\profile-root.cer'
+
+Get-AzArtifactSigningCertificateChain @profileParameters -Destination 'C:\Signing\profile-chain.der'
+```
+
+Use the same regional endpoint as your build. These commands download public
+certificates, not private keys, and do not install them into a trust store.
+See Microsoft's
+[`Get-AzArtifactSigningCertificateRoot`](https://learn.microsoft.com/powershell/module/az.artifactsigning/get-azartifactsigningcertificateroot)
+and
+[`Get-AzArtifactSigningCertificateChain`](https://learn.microsoft.com/powershell/module/az.artifactsigning/get-azartifactsigningcertificatechain)
+documentation.
+
+The chain file contains several certificates, not a single intermediate `.cer`.
+Open it in Windows Certificate Manager, select each required intermediate CA,
+and choose **All Tasks > Export > DER encoded binary X.509 (.CER)**.
+For the example below, save the required intermediate as
+`C:\Signing\profile-intermediate.cer`. Repeat for any additional intermediates.
+Do not import the whole chain into the root store.
+
+For local builds, import any missing CA certificates after independently
+verifying them. Skip this step if Windows already trusts the chain:
+
+```powershell
+# Trusts this CA for the current Windows user. Review it before importing.
+Import-Certificate -FilePath 'C:\Signing\profile-root.cer' -CertStoreLocation 'Cert:\CurrentUser\Root'
+# Only if the profile's chain requires this intermediate certificate:
+Import-Certificate -FilePath 'C:\Signing\profile-intermediate.cer' -CertStoreLocation 'Cert:\CurrentUser\CA'
+```
+
+See [`Import-Certificate`](https://learn.microsoft.com/powershell/module/pki/import-certificate)
+for certificate-store options and
+[Artifact Signing trust models](https://learn.microsoft.com/azure/artifact-signing/concept-trust-models)
+for how trust differs by profile.
+
+`build.ps1` does not install CA certificates or change trust settings.
+If SignTool reports success but verification says the chain ends in an
+untrusted root, signing succeeded remotely but Windows rejected the signature
+locally. The build deliberately stops without moving the MSI to `out`, and
+leaves any previous output unchanged. Install the approved CA chain and rerun.
+**Do not comment out `Assert-MsiSignature` or bypass verification.**
+The timestamp certificate's chain must also be trusted.
+
+#### Read the signer subject
+
+Before the first build, read the signing certificate's exact subject from the
+downloaded chain. This does not install any certificates:
+
+```powershell
+$chain = [System.Security.Cryptography.X509Certificates.X509Certificate2Collection]::new()
+$chain.Import('C:\Signing\profile-chain.der')
+$signers = @($chain | Where-Object {
+    $constraints = $_.Extensions | Where-Object { $_.Oid.Value -eq '2.5.29.19' }
+    $eku = $_.Extensions | Where-Object { $_.Oid.Value -eq '2.5.29.37' }
+    -not ($constraints -and $constraints.CertificateAuthority) -and
+        $eku -and '1.3.6.1.5.5.7.3.3' -in $eku.EnhancedKeyUsages.Value
+})
+if ($signers.Count -ne 1) { throw 'Expected one code-signing leaf certificate in the profile chain.' }
+$expectedSignerSubject = $signers[0].Subject
+$expectedSignerSubject
+```
+
+Keep `$expectedSignerSubject` for the build and setup examples below.
+Use the complete subject, not a friendly publisher name or a CA's subject.
+For an existing signed MSI, read its
+`(Get-AuthenticodeSignature -LiteralPath '<MSI_PATH>').SignerCertificate.Subject`
+instead.
+
+#### Tools and authentication
+
+Use Windows 10 version 1809 or newer, Windows 11, or Windows Server 2016 or newer
+for Artifact Signing. These are signing-host requirements, not the MSI's target
+OS requirements.
 
 For command-line builds, the script downloads pinned
 `Microsoft.Windows.SDK.BuildTools` and `Microsoft.ArtifactSigning.Client` NuGet
@@ -235,28 +352,32 @@ building. It does not install system-wide runtimes, and unpacking the tools
 does not require administrator access. See Microsoft's
 [Artifact Signing client prerequisites](https://learn.microsoft.com/en-us/azure/artifact-signing/how-to-signing-integrations).
 
-Authenticate Azure CLI to the intended tenant first. The generated dlib metadata
-excludes alternative credential providers and uses the existing Azure CLI
-session. The script does not log in or accept client secrets.
+Install [Azure CLI](https://learn.microsoft.com/cli/azure/install-azure-cli)
+and authenticate separately from the Azure PowerShell login above.
+The generated dlib metadata uses only this CLI session:
 
 ```powershell
+az login --tenant '<TENANT_ID>'
+if ($LASTEXITCODE -ne 0) { throw 'Azure CLI login failed.' }
+az account set --subscription '<SUBSCRIPTION_ID>'
+if ($LASTEXITCODE -ne 0) { throw 'Could not select the signing subscription.' }
+
 .\build.ps1 `
     -ArtifactSigningEndpoint 'https://neu.codesigning.azure.net/' `
     -ArtifactSigningAccountName '<YOUR_ACCOUNT>' `
     -ArtifactSigningCertificateProfileName '<YOUR_PROFILE>' `
-    -ExpectedSignerSubject 'CN=Example Organization, O=Example Organization, C=US'
+    -ExpectedSignerSubject $expectedSignerSubject
 ```
+
+The script does not log in or accept client secrets.
 
 To use your own approved tools, pass `-SignToolPath` and/or
 `-ArtifactSigningDlibPath`. Each supplied path bypasses the corresponding
 package download. Use matching x64 tools and keep all adjacent dependency files.
 Runtime prerequisite checks still apply.
 
-Replace the example subject with the complete, exact certificate subject
-reported by Windows `SignerCertificate.Subject` for your profile.
-A friendly publisher name is not enough. Select the endpoint for the
-account's actual Azure region. Local, Key Vault, and Artifact Signing parameters
-are mutually exclusive.
+Select the endpoint for the account's actual Azure region. Local, Key Vault,
+and Artifact Signing parameters are mutually exclusive.
 
 Artifact Signing always requires an RFC 3161 timestamp. If `-TimestampServer`
 is omitted, this backend uses `http://timestamp.acs.microsoft.com`; both digests
@@ -269,15 +390,18 @@ The script requires a valid Windows signature, matching subject, Code Signing
 EKU, and timestamp. Optionally pass `-ExpectedProfileEku` with the profile's
 durable identity EKU (`1.3.6.1.4.1.311.97...`) to distinguish profiles belonging
 to the same publisher. Use it once you know the profile's EKU.
+Do not use the common Public Trust EKU `1.3.6.1.4.1.311.97.1.0` as a profile pin.
 Do not pin a leaf thumbprint. Artifact Signing certificates rotate daily and
 last about 72 hours.
+Public Trust Test signatures expire with the signing certificate even when
+timestamped.
 Deleting and recreating a profile changes its durable EKU.
 See [certificate management](https://learn.microsoft.com/en-us/azure/artifact-signing/concept-certificate-management).
 
 Verify a signed MSI's identity, timestamp, and complete payload with:
 
 ```powershell
-.\verify.ps1 -ExpectedSignerSubject 'CN=Example Organization, O=Example Organization, C=US'
+.\verify.ps1 -ExpectedSignerSubject $expectedSignerSubject
 ```
 
 Add the same `-ExpectedProfileEku` if configured at signing time. Without these
@@ -317,6 +441,8 @@ It calls `build.ps1` in unsigned mode, then uses the official action to sign.
 The action installs the `ArtifactSigning` PowerShell module and manages its
 signing tools on the runner. This is separate from local execution, which uses
 cached SignTool+dlib directly without that module.
+For Private Trust, the workflow also imports the approved CA certificates
+supplied during setup. The signing action does not configure that trust.
 
 The workflows are independent. `artifact-signing.yml` builds its own MSI
 without reusing the unsigned artifact or waiting for a successful CI run.
@@ -335,6 +461,8 @@ Before running, you need an existing Public Trust or Private Trust code-signing
 profile, its full ARM resource ID, its exact expected certificate subject, and
 one to six reviewers. Reviewers can be GitHub usernames or `ORG/TEAM-SLUG`
 values, and must have repository read access.
+For Private Trust, also obtain and approve the root CA `.cer` file and any
+required intermediate CA `.cer` files using the certificate steps above.
 
 The GitHub caller needs repository administrator access and API permissions for
 environments, Actions variables, OIDC settings, and reviewer metadata. Azure
@@ -350,9 +478,13 @@ OIDC subject format.
 $setup = @{
     Repository = 'YOUR_ORG/YOUR_REPOSITORY'
     CertificateProfileId = '/subscriptions/<SUBSCRIPTION_ID>/resourceGroups/<RESOURCE_GROUP>/providers/Microsoft.CodeSigning/codeSigningAccounts/<ACCOUNT>/certificateProfiles/<PROFILE>'
-    ExpectedSignerSubject = 'CN=Example Organization, O=Example Organization, C=US'
+    ExpectedSignerSubject = $expectedSignerSubject
     Reviewer = @('release-reviewer', 'YOUR_ORG/release-team')
 }
+
+# For Private Trust, add the approved CA files before running setup:
+# $setup.TrustedRootCertificatePath = 'C:\Signing\profile-root.cer'
+# $setup.IntermediateCertificatePath = @('C:\Signing\profile-intermediate.cer')
 
 .\setup-artifact-signing.ps1 @setup -WhatIf
 .\setup-artifact-signing.ps1 @setup
@@ -366,6 +498,15 @@ application. By default, the script creates or reuses a dedicated application
 named from the GitHub repository ID. Rerunning does not create duplicates.
 It never creates a client secret. Tenant, subscription, regional endpoint, and
 account/profile names are derived from the specified Azure resource.
+
+`-TrustedRootCertificatePath` is required for Private Trust and normally omitted
+for Public Trust. Add `-IntermediateCertificatePath` only when needed; it accepts
+multiple `.cer` paths. Setup validates the supplied CA files and stores their
+public certificates in environment variables. It does not install them locally.
+The workflow imports the root into `Cert:\CurrentUser\Root` and intermediates
+into `Cert:\CurrentUser\CA` on its temporary runner before building and signing.
+Omitting CA paths on a later Public Trust setup clears the stored CA values.
+Only the CA certificates you supply are explicitly imported by the workflow.
 
 The script first disables signing, then configures the `artifact-signing`
 environment with your reviewers, prevention of self-approval, and a policy
@@ -410,10 +551,15 @@ run live setup; its tests mock all cloud operations.
 | `ARTIFACT_SIGNING_ENDPOINT` | Correct regional HTTPS endpoint |
 | `ARTIFACT_SIGNING_ACCOUNT_NAME` | Organization's signing account |
 | `ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME` | Intended certificate profile |
+| `ARTIFACT_SIGNING_PROFILE_TYPE` | `PublicTrust` or `PrivateTrust`, derived by setup |
+| `ARTIFACT_SIGNING_ROOT_CERTIFICATE_BASE64` | Approved public root `.cer`, base64-encoded; required for Private Trust |
+| `ARTIFACT_SIGNING_INTERMEDIATE_CERTIFICATES_BASE64` | Optional approved intermediate `.cer` files, one base64-encoded certificate per line |
 | `EXPECTED_SIGNER_SUBJECT` | Complete, exact Windows certificate subject |
 | `EXPECTED_PROFILE_EKU` | Optional durable profile identity EKU |
 
-These are configuration identifiers, not credentials. The signing job receives
+These are configuration values and public certificates, not credentials.
+Rerun setup after updating the workflow to populate the new CA-related variables.
+The signing job receives
 only `contents: read` and `id-token: write` GitHub permissions. Azure login
 exchanges the GitHub OIDC token for an Azure session; signing excludes other
 Azure credential providers. The workflow supports Azure public cloud.

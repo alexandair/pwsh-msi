@@ -29,6 +29,9 @@ jobs:
       ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME: ${{ vars.ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME }}
       EXPECTED_SIGNER_SUBJECT: ${{ vars.EXPECTED_SIGNER_SUBJECT }}
       EXPECTED_PROFILE_EKU: ${{ vars.EXPECTED_PROFILE_EKU }}
+      ARTIFACT_SIGNING_PROFILE_TYPE: ${{ vars.ARTIFACT_SIGNING_PROFILE_TYPE }}
+      ARTIFACT_SIGNING_ROOT_CERTIFICATE_BASE64: ${{ vars.ARTIFACT_SIGNING_ROOT_CERTIFICATE_BASE64 }}
+      ARTIFACT_SIGNING_INTERMEDIATE_CERTIFICATES_BASE64: ${{ vars.ARTIFACT_SIGNING_INTERMEDIATE_CERTIFICATES_BASE64 }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -46,6 +49,18 @@ jobs:
                   throw "Configure the $name variable in the protected artifact-signing environment."
               }
           }
+
+      - name: Configure explicitly approved CA trust
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:ARTIFACT_SIGNING_PROFILE_TYPE -eq 'PrivateTrust' -and
+              [string]::IsNullOrWhiteSpace($env:ARTIFACT_SIGNING_ROOT_CERTIFICATE_BASE64)) {
+              throw 'PrivateTrust requires an approved root CA. Rerun setup with -TrustedRootCertificatePath.'
+          }
+          . .\signing.ps1
+          Import-ArtifactSigningTrust `
+              -RootCertificateBase64 $env:ARTIFACT_SIGNING_ROOT_CERTIFICATE_BASE64 `
+              -IntermediateCertificatesBase64 $env:ARTIFACT_SIGNING_INTERMEDIATE_CERTIFICATES_BASE64
 
       - name: Build unsigned MSI into staging
         id: build

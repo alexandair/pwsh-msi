@@ -63,7 +63,8 @@ BeforeAll {
         'Assert-CodeSigningCertificate', 'Invoke-MsiSigning',
         'Get-KeyVaultSigningCertificate', 'Invoke-KeyVaultMsiSigning',
         'Get-VerifiedFile', 'Get-ArtifactSigningTool',
-        'Get-ArtifactSigningRuntimeStatus', 'Assert-ArtifactSigningPrerequisites'
+        'Get-ArtifactSigningRuntimeStatus', 'Assert-ArtifactSigningPrerequisites',
+        'Publish-Msi'
     )) {
         $function = $build.Find({
             param($node)
@@ -107,6 +108,204 @@ AfterAll {
     if ($expiredCertificate) { $expiredCertificate.Dispose() }
     if ($certificate) { $certificate.Dispose() }
     if ($key) { $key.Dispose() }
+}
+
+Describe 'MSI publication' {
+    BeforeEach {
+        $directory = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
+        $null = New-Item -ItemType Directory -Path $directory
+        $staged = Join-Path $directory 'PowerShell.msi'
+        $destination = Join-Path $directory 'PowerShell-version-win-x64-unofficial.msi'
+        [IO.File]::WriteAllText($staged, 'verified new MSI')
+    }
+
+    It 'publishes a new output without Force' {
+        Publish-Msi -Path $staged -Destination $destination
+
+        [IO.File]::ReadAllText($destination) | Should -BeExactly 'verified new MSI'
+        $staged | Should -Not -Exist
+    }
+
+    It 'replaces existing output with Force' {
+        [IO.File]::WriteAllText($destination, 'previous MSI')
+
+        Publish-Msi -Path $staged -Destination $destination -Force
+
+        [IO.File]::ReadAllText($destination) | Should -BeExactly 'verified new MSI'
+        $staged | Should -Not -Exist
+    }
+
+    It 'preserves existing output and staging when Force is absent' {
+        [IO.File]::WriteAllText($destination, 'previous MSI')
+
+        { Publish-Msi -Path $staged -Destination $destination } | Should -Throw
+
+        [IO.File]::ReadAllText($destination) | Should -BeExactly 'previous MSI'
+        [IO.File]::ReadAllText($staged) | Should -BeExactly 'verified new MSI'
+    }
+
+    It 'preserves existing output when forced publication fails' {
+        [IO.File]::WriteAllText($destination, 'previous MSI')
+        $lock = [IO.File]::Open($destination, 'Open', 'Read', 'None')
+        try {
+            { Publish-Msi -Path $staged -Destination $destination -Force } | Should -Throw
+        }
+        finally {
+            $lock.Dispose()
+        }
+
+        [IO.File]::ReadAllText($destination) | Should -BeExactly 'previous MSI'
+        [IO.File]::ReadAllText($staged) | Should -BeExactly 'verified new MSI'
+    }
+}
+
+Describe 'Explicit Artifact Signing CA trust' -Skip:(-not $IsWindows) {
+    BeforeAll {
+        $rootRequest = [Security.Cryptography.X509Certificates.CertificateRequest]::new(
+            'CN=Artifact Signing test root', $key, [Security.Cryptography.HashAlgorithmName]::SHA256,
+            [Security.Cryptography.RSASignaturePadding]::Pkcs1
+        )
+        $rootRequest.CertificateExtensions.Add(
+            [Security.Cryptography.X509Certificates.X509BasicConstraintsExtension]::new($true, $false, 0, $true)
+        )
+        $rootRequest.CertificateExtensions.Add(
+            [Security.Cryptography.X509Certificates.X509KeyUsageExtension]::new(
+                [Security.Cryptography.X509Certificates.X509KeyUsageFlags]::KeyCertSign, $true
+            )
+        )
+        $rootCa = $rootRequest.CreateSelfSigned(
+            [DateTimeOffset]::Now.AddMinutes(-5), [DateTimeOffset]::Now.AddDays(1)
+        )
+        $intermediateRequest = [Security.Cryptography.X509Certificates.CertificateRequest]::new(
+            'CN=Artifact Signing test intermediate', $key, [Security.Cryptography.HashAlgorithmName]::SHA256,
+            [Security.Cryptography.RSASignaturePadding]::Pkcs1
+        )
+        $intermediateRequest.CertificateExtensions.Add(
+            [Security.Cryptography.X509Certificates.X509BasicConstraintsExtension]::new($true, $false, 0, $true)
+        )
+        $intermediateCa = $intermediateRequest.Create(
+            $rootCa, [DateTimeOffset]::Now.AddMinutes(-1), [DateTimeOffset]::Now.AddHours(1), [byte[]] @(1, 2, 3)
+        )
+        $rootBase64 = [Convert]::ToBase64String($rootCa.RawData)
+        $intermediateBase64 = [Convert]::ToBase64String($intermediateCa.RawData)
+        $leafBase64 = [Convert]::ToBase64String($publicCertificate.RawData)
+    }
+
+    AfterAll {
+        $intermediateCa.Dispose()
+        $rootCa.Dispose()
+    }
+
+    BeforeEach {
+        $script:importPaths = @()
+        $script:importedCertificates = @()
+        Mock Import-Certificate {
+            $script:importPaths += $FilePath
+            $imported = [Security.Cryptography.X509Certificates.X509Certificate2]::new(
+                [IO.File]::ReadAllBytes($FilePath)
+            )
+            try {
+                $script:importedCertificates += @{
+                    Thumbprint = $imported.Thumbprint
+                    Store = $CertStoreLocation
+                }
+            }
+            finally { $imported.Dispose() }
+        }
+    }
+
+    It 'does not change trust when no additional CA certificates are configured' {
+        Import-ArtifactSigningTrust
+
+        Should -Invoke Import-Certificate -Times 0
+    }
+
+    It 'imports only the approved root and intermediates into their correct stores and removes temporary files' {
+        Import-ArtifactSigningTrust -RootCertificateBase64 $rootBase64 `
+            -IntermediateCertificatesBase64 "$intermediateBase64`n$intermediateBase64"
+
+        $script:importedCertificates.Count | Should -Be 3
+        $script:importedCertificates[0].Thumbprint | Should -Be $rootCa.Thumbprint
+        $script:importedCertificates[0].Store | Should -BeExactly 'Cert:\CurrentUser\Root'
+        $script:importedCertificates[1].Thumbprint | Should -Be $intermediateCa.Thumbprint
+        $script:importedCertificates[1].Store | Should -BeExactly 'Cert:\CurrentUser\CA'
+        $script:importedCertificates[2].Store | Should -BeExactly 'Cert:\CurrentUser\CA'
+        foreach ($path in $script:importPaths) { $path | Should -Not -Exist }
+    }
+
+    It 'rejects a signing leaf as a root CA' {
+        { Import-ArtifactSigningTrust -RootCertificateBase64 $leafBase64 } | Should -Throw '*not a CA certificate*'
+
+        Should -Invoke Import-Certificate -Times 0
+    }
+
+    It 'validates every certificate before making any trust changes' {
+        { Import-ArtifactSigningTrust -RootCertificateBase64 $rootBase64 `
+            -IntermediateCertificatesBase64 "$intermediateBase64`n$leafBase64" } |
+            Should -Throw '*not a CA certificate*'
+
+        Should -Invoke Import-Certificate -Times 0
+    }
+
+    It 'rejects a root or intermediate assigned to the wrong store' {
+        { Get-ArtifactSigningCaCertificate -Base64Certificate $intermediateBase64 -Root } |
+            Should -Throw '*root CA must be self-issued*'
+        { Get-ArtifactSigningCaCertificate -Base64Certificate $rootBase64 } |
+            Should -Throw '*intermediate CA is a root*'
+    }
+
+    It 'rejects malformed or private-key input instead of installing it' {
+        { Import-ArtifactSigningTrust -RootCertificateBase64 'not-base64' } | Should -Throw
+        $pfx = [Convert]::ToBase64String($rootCa.Export(
+            [Security.Cryptography.X509Certificates.X509ContentType]::Pfx
+        ))
+        { Import-ArtifactSigningTrust -RootCertificateBase64 $pfx } | Should -Throw '*not a PFX*'
+
+        Should -Invoke Import-Certificate -Times 0
+    }
+
+    It 'reports import failures and removes temporary certificate files' {
+        Mock Import-Certificate {
+            $script:importPaths += $FilePath
+            throw 'Certificate store write denied'
+        }
+
+        { Import-ArtifactSigningTrust -RootCertificateBase64 $rootBase64 } |
+            Should -Throw '*Certificate store write denied*'
+
+        $script:importPaths.Count | Should -Be 1
+        $script:importPaths[0] | Should -Not -Exist
+    }
+
+    It 'runs the README subject-discovery example with <SignerCount> signing leaves' -TestCases @(
+        @{ SignerCount = 0 }
+        @{ SignerCount = 1 }
+        @{ SignerCount = 2 }
+    ) {
+        param($SignerCount)
+
+        $certificates = [Security.Cryptography.X509Certificates.X509Certificate2Collection]::new()
+        $null = $certificates.Add($rootCa)
+        $null = $certificates.Add($intermediateCa)
+        if ($SignerCount -ge 1) { $null = $certificates.Add($publicCertificate) }
+        if ($SignerCount -eq 2) { $null = $certificates.Add($expiredCertificate) }
+        $chainPath = Join-Path $TestDrive 'profile-chain.der'
+        [IO.File]::WriteAllBytes($chainPath, $certificates.Export(
+            [Security.Cryptography.X509Certificates.X509ContentType]::Pkcs7
+        ))
+        $readme = Get-Content (Join-Path $PSScriptRoot '..\README.md') -Raw
+        $example = [regex]::Match($readme, '(?ms)^```powershell\r?\n(\$chain = .*?)^```').Groups[1].Value
+        if (-not $example) { throw 'README subject-discovery example not found.' }
+        $escapedPath = $chainPath.Replace("'", "''")
+        $scriptBlock = [scriptblock]::Create($example.Replace("'C:\Signing\profile-chain.der'", "'$escapedPath'"))
+
+        if ($SignerCount -eq 1) {
+            & $scriptBlock | Should -BeExactly $publicCertificate.Subject
+        }
+        else {
+            { & $scriptBlock } | Should -Throw '*Expected one code-signing leaf certificate*'
+        }
+    }
 }
 
 Describe 'Signing input validation' -Skip:(-not $IsWindows) {

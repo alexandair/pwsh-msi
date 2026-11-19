@@ -45,6 +45,17 @@ Existing Entra application's client ID in the profile's subscription tenant.
 Otherwise creates or reuses an application named from the GitHub repository ID.
 Unrelated credentials and existing permissions are not removed.
 
+.PARAMETER TrustedRootCertificatePath
+Approved public root CA certificate (.cer) for the hosted runner. Required for
+PrivateTrust profiles. Setup stores the certificate in a GitHub environment
+variable; the workflow imports it into the runner's current-user Root store.
+Does not install certificates on the machine running setup.
+
+.PARAMETER IntermediateCertificatePath
+Optional approved intermediate CA certificate files (.cer). The workflow imports
+them into the runner's current-user CA store. Omitting CA paths clears previously
+configured CA variables. PublicTrust normally needs neither CA parameter.
+
 .PARAMETER Dispatch
 Starts artifact-signing.yml on the default branch after verified setup.
 A designated reviewer must still approve it. A dispatch failure does not undo
@@ -73,6 +84,13 @@ before configuring the signing environment, identity, permissions, and variables
 
 Uses an existing application and a known profile EKU, then starts the workflow.
 Replace the client ID and example OID with your actual values.
+
+.EXAMPLE
+.\setup-artifact-signing.ps1 @setup -TrustedRootCertificatePath 'C:\Signing\profile-root.cer' -IntermediateCertificatePath 'C:\Signing\profile-intermediate.cer'
+
+Configures a Private Trust profile with explicitly approved CA certificates.
+Verify their fingerprints before supplying them. Omit the intermediate parameter
+when no additional intermediate CA installation is needed.
 
 .NOTES
 Authenticate az and gh before running. Requires permission to manage repository
@@ -115,6 +133,12 @@ param(
 
     [ValidatePattern('^[a-fA-F0-9-]{36}$')]
     [string] $ApplicationClientId,
+
+    [ValidateNotNullOrEmpty()]
+    [string] $TrustedRootCertificatePath,
+
+    [ValidateNotNullOrEmpty()]
+    [string[]] $IntermediateCertificatePath,
 
     [switch] $Dispatch
 )
@@ -255,6 +279,8 @@ function Invoke-ArtifactSigningSetup {
         [string[]] $Reviewer,
         [string] $ExpectedProfileEku,
         [string] $ApplicationClientId,
+        [string] $TrustedRootCertificatePath,
+        [string[]] $IntermediateCertificatePath,
         [switch] $Dispatch
     )
 
@@ -277,12 +303,28 @@ function Invoke-ArtifactSigningSetup {
     $oidc = Invoke-SetupGitHub -Endpoint "$repoEndpoint/actions/oidc/customization/sub"
     if (-not $oidc.use_default) { throw 'Custom GitHub OIDC subject templates are not supported by this setup script.' }
 
-    $profile = Invoke-SetupAzure -SubscriptionId $subscriptionId -Arguments @(
+    $certificateProfile = Invoke-SetupAzure -SubscriptionId $subscriptionId -Arguments @(
         'resource', 'show', '--ids', $CertificateProfileId, '--api-version', '2025-10-13'
     )
-    if ($profile.id -ne $CertificateProfileId -or $profile.properties.profileType -notin 'PublicTrust', 'PrivateTrust') {
+    if ($certificateProfile.id -ne $CertificateProfileId -or $certificateProfile.properties.profileType -notin 'PublicTrust', 'PrivateTrust') {
         throw 'Select an existing PublicTrust or PrivateTrust code-signing certificate profile.'
     }
+    if ($certificateProfile.properties.profileType -eq 'PrivateTrust' -and -not $TrustedRootCertificatePath) {
+        throw 'PrivateTrust requires -TrustedRootCertificatePath with an approved root CA certificate for the hosted runner.'
+    }
+    $rootCertificateBase64 = ''
+    if ($TrustedRootCertificatePath) {
+        $rootCertificate = Get-ArtifactSigningCaCertificate -Path $TrustedRootCertificatePath -Root
+        try { $rootCertificateBase64 = [Convert]::ToBase64String($rootCertificate.RawData) }
+        finally { $rootCertificate.Dispose() }
+    }
+    $intermediateCertificatesBase64 = @(
+        foreach ($path in $IntermediateCertificatePath) {
+            $intermediateCertificate = Get-ArtifactSigningCaCertificate -Path $path
+            try { [Convert]::ToBase64String($intermediateCertificate.RawData) }
+            finally { $intermediateCertificate.Dispose() }
+        }
+    ) -join "`n"
     $accountId = $CertificateProfileId.Substring(0, $CertificateProfileId.LastIndexOf('/certificateProfiles/', [StringComparison]::OrdinalIgnoreCase))
     $account = Invoke-SetupAzure -SubscriptionId $subscriptionId -Arguments @(
         'resource', 'show', '--ids', $accountId, '--api-version', '2025-10-13'
@@ -438,6 +480,9 @@ function Invoke-ArtifactSigningSetup {
             ARTIFACT_SIGNING_ENDPOINT = $endpoint.AbsoluteUri
             ARTIFACT_SIGNING_ACCOUNT_NAME = $accountId.Split('/')[-1]
             ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME = $CertificateProfileId.Split('/')[-1]
+            ARTIFACT_SIGNING_PROFILE_TYPE = [string] $certificateProfile.properties.profileType
+            ARTIFACT_SIGNING_ROOT_CERTIFICATE_BASE64 = $rootCertificateBase64
+            ARTIFACT_SIGNING_INTERMEDIATE_CERTIFICATES_BASE64 = $intermediateCertificatesBase64
             EXPECTED_SIGNER_SUBJECT = $ExpectedSignerSubject
             EXPECTED_PROFILE_EKU = $ExpectedProfileEku
         }
