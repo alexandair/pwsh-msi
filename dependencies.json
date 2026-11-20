@@ -27,6 +27,9 @@
     "sha256": "74bd7d27e6ce1051409c38d9b46bc8df0400ecd643d51ffbf2ac00869061e40b",
     "toolPath": "bin\\x64\\Azure.CodeSigning.Dlib.dll"
   },
+  "azArtifactSigning": {
+    "version": "0.2.2"
+  },
   "testing": {
     "pesterVersion": "5.7.1"
   },

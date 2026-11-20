@@ -313,9 +313,11 @@ CAs. Azure signing permission alone is not enough.
 | Machine | Public Trust | Private Trust |
 | --- | --- | --- |
 | Local Windows | Normally trusted through Windows updates; install missing CA certificates if needed | Configure CA trust explicitly |
-| GitHub-hosted Windows runner | Normally already trusted | Supply approved CA certificates to setup; the workflow imports them on the runner |
+| GitHub-hosted Windows runner | Normally already trusted | The workflow retrieves and imports the profile's CA certificates automatically |
 
 Installing a CA locally does not configure a GitHub-hosted runner.
+The manual steps below are for local builds; the GitHub workflow configures its
+own runner's trust automatically.
 Test profiles can also need explicit trust setup.
 
 Obtain the correct root and intermediate certificates from your organization's
@@ -524,24 +526,28 @@ It calls `build.ps1` in unsigned mode, then uses the official action to sign.
 The action installs the `ArtifactSigning` PowerShell module and manages its
 signing tools on the runner. This is separate from local execution, which uses
 cached SignTool+dlib directly without that module.
-For Private Trust, the workflow also imports the approved CA certificates
-supplied during setup. The signing action does not configure that trust.
+For Private Trust, the workflow retrieves the configured profile's public CA
+certificates and imports them on the runner after OIDC login. The signing action
+does not configure that Windows trust itself. No local `.cer` files are needed.
 
 The workflows are independent. `artifact-signing.yml` builds its own MSI
 without reusing the unsigned artifact or waiting for a successful CI run.
 It does not run Pester. Before upload, it checks the signed MSI's publisher,
 timestamp, optional profile EKU, installer identity, and payload.
 
-#### Test the GitHub workflow
+#### One-time setup and starting runs
 
-Use `github-artifact-signing.ps1` for setup, starting a run, and downloading and
-verifying its signed MSI. The helper reuses `setup-artifact-signing.ps1`; it does
-not create another signing account or certificate profile.
+Use `github-artifact-signing.ps1` locally only to set up Azure/GitHub resources
+and trigger runs. It delegates setup to `setup-artifact-signing.ps1`.
+All certificate retrieval, CA trust configuration, MSI building, signing,
+timestamping, verification, and artifact upload happen on the Windows runner.
+You do not need local certificates, Windows trust configuration, MSI tools,
+Azure PowerShell, or a cached PowerShell ZIP for this approach.
 
-First, commit and push the current changes, including the helper and tests, to
-your remote repository's default branch. Enable GitHub Actions if needed. The helper
-checks those files against the remote revision so you do not accidentally test
-an older workflow. It never commits or pushes for you.
+First, push the current workflow and supporting scripts to your remote
+repository's default branch. Enable GitHub Actions if needed. The runner uses
+that remote revision, not uncommitted local changes. Neither setup script
+commits or pushes for you.
 
 Setup needs the Azure and GitHub permissions described in
 [Automated local setup](#automated-local-setup). Permission to sign locally is
@@ -556,68 +562,47 @@ az login --tenant '<TENANT_ID>'
 if ($LASTEXITCODE -ne 0) { throw 'Azure CLI login failed.' }
 ```
 
-Set the repository, exact signer subject from your working local test, and setup
-options. Replace the placeholders with your existing profile:
+Set the repository and your existing profile's resource ID and exact signer
+subject, then preview and run setup once:
 
 ```powershell
-$github = @{
+$setup = @{
     Repository = 'YOUR_ORG/YOUR_REPOSITORY'
+    CertificateProfileId = '/subscriptions/<SUBSCRIPTION_ID>/resourceGroups/<RESOURCE_GROUP>/providers/Microsoft.CodeSigning/codeSigningAccounts/<ACCOUNT>/certificateProfiles/<PROFILE>'
     ExpectedSignerSubject = '<EXACT_SIGNER_SUBJECT>'
 }
-$setup = @{
-    CertificateProfileId = '/subscriptions/<SUBSCRIPTION_ID>/resourceGroups/<RESOURCE_GROUP>/providers/Microsoft.CodeSigning/codeSigningAccounts/<ACCOUNT>/certificateProfiles/<PROFILE>'
-}
 
-# For Private Trust, supply the CA files already approved for your local test:
-$setup.TrustedRootCertificatePath = 'C:\Signing\profile-root.cer'
-# Only if needed:
-# $setup.IntermediateCertificatePath = @('C:\Signing\profile-intermediate.cer')
-
-.\github-artifact-signing.ps1 @github -Setup @setup -WhatIf
-.\github-artifact-signing.ps1 @github -Setup @setup
+.\github-artifact-signing.ps1 -Setup @setup -WhatIf
+.\github-artifact-signing.ps1 -Setup @setup
 ```
 
-Omit the CA options for Public Trust unless the runner needs additional trust.
-Setup derives the regional endpoint from the Azure account. It configures the
-runner's trust, not your local certificate stores. The preview makes no cloud
-changes; the actual setup asks for confirmation.
+The same commands work for Public Trust and Private Trust. Setup derives the
+regional endpoint from the Azure account and saves the workflow configuration
+in GitHub. The preview makes no cloud changes; actual setup asks for confirmation.
+Add `-ExpectedProfileEku` during setup if you also want that identity check.
 
 Start a run after setup succeeds:
 
 ```powershell
-$run = .\github-artifact-signing.ps1 @github -Run
+$run = .\github-artifact-signing.ps1 -Repository 'YOUR_ORG/YOUR_REPOSITORY' -Run
 $run
 ```
 
 Open `RunUrl` and wait for the run to finish successfully. The helper returns
 the exact dispatched `RunId`, without guessing which run is latest.
-An approval step is needed only if you explicitly configured reviewers.
+An approval step is needed only if you explicitly configured reviewers. You can
+also start runs from the workflow's **Run workflow** button in GitHub.
+Subsequent triggers need only GitHub authentication, not a local Azure login.
+Repeat setup only when its configuration changes.
 
-Download and verify that run on your Windows machine:
-
-```powershell
-.\github-artifact-signing.ps1 @github -RunId $run.RunId
-```
-
-Keep the locally trusted CAs and cached PowerShell ZIP from your successful
-local test. The checkout's workflow, build script, verification script, signing
-helpers, and `dependencies.json` must match the run's revision. The helper rejects
-failed or incomplete runs and skipped signing jobs. It downloads only
-`powershell-msi-signed`, verifies the signature, exact signer, timestamp, installer,
-and full payload, and compares the MSI's SHA-256 with that run attempt's log.
-Add `ExpectedProfileEku` to `$github` before setup if you also want that check.
-
-Only a verified MSI is moved to
-`out\github\<OWNER>\<REPOSITORY>\<RUN_ID>\attempt-<ATTEMPT>`. Your locally built
-MSI in `out` is left alone. To download the same run attempt again:
+Download `powershell-msi-signed` from the successful run's **Artifacts** section
+if you want a local copy. Verification has already completed on the runner.
+Alternatively, download with GitHub CLI:
 
 ```powershell
-.\github-artifact-signing.ps1 @github -RunId $run.RunId -Force
+gh run download $run.RunId --repo 'github.com/YOUR_ORG/YOUR_REPOSITORY' `
+    --name powershell-msi-signed --dir ".\out\github\$($run.RunId)"
 ```
-
-In a new shell, recreate `$github` and supply the numeric run ID from the GitHub
-run URL instead of `$run.RunId`. To build and sign a new MSI, use `-Run` again;
-you do not need to repeat setup unless its configuration changes.
 
 #### Automated local setup
 
@@ -632,8 +617,7 @@ profile, its full ARM resource ID, and its exact expected certificate subject.
 Reviewers are optional. To require approval by another person, supply `-Reviewer`
 with up to six GitHub usernames or `ORG/TEAM-SLUG` values with repository read
 access. Without `-Reviewer`, setup configures no reviewer approval.
-For Private Trust, also obtain and approve the root CA `.cer` file and any
-required intermediate CA `.cer` files using the certificate steps above.
+No local CA files or certificate installation are required for either profile type.
 
 The GitHub caller needs repository administrator access and API permissions for
 environments, Actions variables, OIDC settings, and reviewer metadata. Azure
@@ -652,10 +636,6 @@ $setup = @{
     ExpectedSignerSubject = $expectedSignerSubject
 }
 
-# For Private Trust, add the approved CA files before running setup:
-# $setup.TrustedRootCertificatePath = 'C:\Signing\profile-root.cer'
-# $setup.IntermediateCertificatePath = @('C:\Signing\profile-intermediate.cer')
-
 .\setup-artifact-signing.ps1 @setup -WhatIf
 .\setup-artifact-signing.ps1 @setup
 ```
@@ -669,14 +649,13 @@ named from the GitHub repository ID. Rerunning does not create duplicates.
 It never creates a client secret. Tenant, subscription, regional endpoint, and
 account/profile names are derived from the specified Azure resource.
 
-`-TrustedRootCertificatePath` is required for Private Trust and normally omitted
-for Public Trust. Add `-IntermediateCertificatePath` only when needed; it accepts
-multiple `.cer` paths. Setup validates the supplied CA files and stores their
-public certificates in environment variables. It does not install them locally.
-The workflow imports the root into `Cert:\CurrentUser\Root` and intermediates
-into `Cert:\CurrentUser\CA` on its temporary runner before building and signing.
-Omitting CA paths on a later Public Trust setup clears the stored CA values.
-Only the CA certificates you supply are explicitly imported by the workflow.
+For Private Trust, Azure login also enables an Azure PowerShell session on the
+runner. The workflow uses `Az.ArtifactSigning`, pinned in `dependencies.json`,
+to retrieve the selected profile's root and certificate chain. It checks the
+expected signer subject and imports the root into `Cert:\CurrentUser\Root` and
+intermediates into `Cert:\CurrentUser\CA` on that temporary runner. Public Trust
+normally uses the runner's existing Windows trust. This requires no local
+Azure PowerShell session or certificate-store changes.
 
 The script first disables signing, then configures the `artifact-signing`
 environment to allow only the default branch. It replaces the environment's
@@ -723,14 +702,10 @@ run live setup; its tests mock all cloud operations.
 | `ARTIFACT_SIGNING_ACCOUNT_NAME` | Organization's signing account |
 | `ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME` | Intended certificate profile |
 | `ARTIFACT_SIGNING_PROFILE_TYPE` | `PublicTrust` or `PrivateTrust`, derived by setup |
-| `ARTIFACT_SIGNING_ROOT_CERTIFICATE_BASE64` | Approved public root `.cer`, base64-encoded; required for Private Trust |
-| `ARTIFACT_SIGNING_INTERMEDIATE_CERTIFICATES_BASE64` | Optional approved intermediate `.cer` files, one base64-encoded certificate per line |
 | `EXPECTED_SIGNER_SUBJECT` | Complete, exact Windows certificate subject |
 | `EXPECTED_PROFILE_EKU` | Optional durable profile identity EKU |
 
-These are configuration values and public certificates, not credentials.
-Rerun setup after updating the workflow to populate the new CA-related variables.
-The signing job receives
+These are configuration values, not credentials. The signing job receives
 only `contents: read` and `id-token: write` GitHub permissions. Azure login
 exchanges the GitHub OIDC token for an Azure session; signing excludes other
 Azure credential providers. The workflow supports Azure public cloud.
@@ -743,7 +718,8 @@ Failed verification stops publication. No unsigned fallback is uploaded.
 The post-signing SHA-256 is written to the run log.
 
 Before distributing signed packages, run the workflow in an eligible
-organization's configured environment. Download the artifact and check
+organization's configured environment and confirm its verification succeeds.
+For an optional independent check, download the artifact and run
 `Get-AuthenticodeSignature` on a trusted Windows machine. Confirm `Valid`,
 the intended subject/profile EKU, a populated `TimeStamperCertificate`, and the
 logged SHA-256. Confirm the run's full payload verification succeeded.

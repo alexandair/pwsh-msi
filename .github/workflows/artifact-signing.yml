@@ -30,8 +30,6 @@ jobs:
       EXPECTED_SIGNER_SUBJECT: ${{ vars.EXPECTED_SIGNER_SUBJECT }}
       EXPECTED_PROFILE_EKU: ${{ vars.EXPECTED_PROFILE_EKU }}
       ARTIFACT_SIGNING_PROFILE_TYPE: ${{ vars.ARTIFACT_SIGNING_PROFILE_TYPE }}
-      ARTIFACT_SIGNING_ROOT_CERTIFICATE_BASE64: ${{ vars.ARTIFACT_SIGNING_ROOT_CERTIFICATE_BASE64 }}
-      ARTIFACT_SIGNING_INTERMEDIATE_CERTIFICATES_BASE64: ${{ vars.ARTIFACT_SIGNING_INTERMEDIATE_CERTIFICATES_BASE64 }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -43,24 +41,53 @@ jobs:
           foreach ($name in @(
               'AZURE_CLIENT_ID', 'AZURE_TENANT_ID', 'AZURE_SUBSCRIPTION_ID',
               'ARTIFACT_SIGNING_ENDPOINT', 'ARTIFACT_SIGNING_ACCOUNT_NAME',
-              'ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME', 'EXPECTED_SIGNER_SUBJECT'
+              'ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME', 'EXPECTED_SIGNER_SUBJECT',
+              'ARTIFACT_SIGNING_PROFILE_TYPE'
           )) {
               if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
                   throw "Configure the $name variable in the protected artifact-signing environment."
               }
           }
+          if ($env:ARTIFACT_SIGNING_PROFILE_TYPE -notin 'PublicTrust', 'PrivateTrust') {
+              throw 'Rerun setup with a Public Trust or Private Trust code-signing profile.'
+          }
 
-      - name: Configure explicitly approved CA trust
+      - name: Authenticate to Azure using OIDC
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+          enable-AzPSSession: ${{ env.ARTIFACT_SIGNING_PROFILE_TYPE == 'PrivateTrust' }}
+
+      - name: Configure Private Trust CA certificates on the runner
+        if: env.ARTIFACT_SIGNING_PROFILE_TYPE == 'PrivateTrust'
         run: |
           $ErrorActionPreference = 'Stop'
-          if ($env:ARTIFACT_SIGNING_PROFILE_TYPE -eq 'PrivateTrust' -and
-              [string]::IsNullOrWhiteSpace($env:ARTIFACT_SIGNING_ROOT_CERTIFICATE_BASE64)) {
-              throw 'PrivateTrust requires an approved root CA. Rerun setup with -TrustedRootCertificatePath.'
+          $dependencies = Get-Content .\dependencies.json -Raw | ConvertFrom-Json
+          $moduleVersion = $dependencies.azArtifactSigning.version
+          if (-not (Get-Module -ListAvailable Az.ArtifactSigning | Where-Object Version -EQ $moduleVersion)) {
+              Install-Module Az.ArtifactSigning -RequiredVersion $moduleVersion -Scope CurrentUser -Force
           }
+          Import-Module Az.ArtifactSigning -RequiredVersion $moduleVersion -ErrorAction Stop
+          $download = @{
+              SubscriptionId = $env:AZURE_SUBSCRIPTION_ID
+              Endpoint = $env:ARTIFACT_SIGNING_ENDPOINT
+              AccountName = $env:ARTIFACT_SIGNING_ACCOUNT_NAME
+              CertificateProfileName = $env:ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME
+              ExpectedSignerSubject = $env:EXPECTED_SIGNER_SUBJECT
+          }
+          $certificates = .\local-artifact-signing.ps1 @download -DownloadCertificates
           . .\signing.ps1
+          $root = [Convert]::ToBase64String([IO.File]::ReadAllBytes($certificates.RootCertificatePath))
+          $intermediates = @(
+              foreach ($path in $certificates.IntermediateCertificatePath) {
+                  [Convert]::ToBase64String([IO.File]::ReadAllBytes($path))
+              }
+          ) -join "`n"
           Import-ArtifactSigningTrust `
-              -RootCertificateBase64 $env:ARTIFACT_SIGNING_ROOT_CERTIFICATE_BASE64 `
-              -IntermediateCertificatesBase64 $env:ARTIFACT_SIGNING_INTERMEDIATE_CERTIFICATES_BASE64
+              -RootCertificateBase64 $root `
+              -IntermediateCertificatesBase64 $intermediates
 
       - name: Build unsigned MSI into staging
         id: build
@@ -76,13 +103,6 @@ jobs:
           Move-Item -LiteralPath $final -Destination $staged
           "staged_msi=$staged" >> $env:GITHUB_OUTPUT
           "final_msi=$final" >> $env:GITHUB_OUTPUT
-
-      - name: Authenticate to Azure using OIDC
-        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3
-        with:
-          client-id: ${{ env.AZURE_CLIENT_ID }}
-          tenant-id: ${{ env.AZURE_TENANT_ID }}
-          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
 
       - name: Sign staged MSI
         uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2

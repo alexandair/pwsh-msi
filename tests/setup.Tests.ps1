@@ -9,7 +9,7 @@ Runs mocked Artifact Signing setup and GitHub workflow tests through Pester.
 Loads setup functions without executing the setup script. Tests environment
 protections, identity and federation reuse, profile-scoped RBAC, workflow
 variables, WhatIf, dispatch, failure handling, and API request safety. Also tests
-the GitHub workflow helper's setup forwarding and downloaded-MSI acceptance.
+the GitHub workflow helper's setup forwarding, dispatch, and runner CA setup.
 
 GitHub, Microsoft Graph, Azure, and native CLI calls are mocked. Does not need
 cloud credentials or change repository settings, identities, or Azure resources.
@@ -50,37 +50,6 @@ BeforeAll {
         }
     }
 
-    $caKey = [Security.Cryptography.RSA]::Create(2048)
-    $caRequest = [Security.Cryptography.X509Certificates.CertificateRequest]::new(
-        'CN=Setup test root', $caKey, [Security.Cryptography.HashAlgorithmName]::SHA256,
-        [Security.Cryptography.RSASignaturePadding]::Pkcs1
-    )
-    $caRequest.CertificateExtensions.Add(
-        [Security.Cryptography.X509Certificates.X509BasicConstraintsExtension]::new($true, $false, 0, $true)
-    )
-    $setupRootCa = $caRequest.CreateSelfSigned(
-        [DateTimeOffset]::Now.AddMinutes(-5), [DateTimeOffset]::Now.AddDays(1)
-    )
-    $setupRootPath = Join-Path $TestDrive 'approved-root.cer'
-    [IO.File]::WriteAllBytes($setupRootPath, $setupRootCa.RawData)
-    $intermediateRequest = [Security.Cryptography.X509Certificates.CertificateRequest]::new(
-        'CN=Setup test intermediate', $caKey, [Security.Cryptography.HashAlgorithmName]::SHA256,
-        [Security.Cryptography.RSASignaturePadding]::Pkcs1
-    )
-    $intermediateRequest.CertificateExtensions.Add(
-        [Security.Cryptography.X509Certificates.X509BasicConstraintsExtension]::new($true, $false, 0, $true)
-    )
-    $setupIntermediateCa = $intermediateRequest.Create(
-        $setupRootCa, [DateTimeOffset]::Now.AddMinutes(-1), [DateTimeOffset]::Now.AddHours(1), [byte[]] @(4, 5, 6)
-    )
-    $setupIntermediatePath = Join-Path $TestDrive 'approved-intermediate.cer'
-    [IO.File]::WriteAllBytes($setupIntermediatePath, $setupIntermediateCa.RawData)
-}
-
-AfterAll {
-    $setupIntermediateCa.Dispose()
-    $setupRootCa.Dispose()
-    $caKey.Dispose()
 }
 
 Describe 'Artifact Signing setup orchestration' {
@@ -329,48 +298,21 @@ Describe 'Artifact Signing setup orchestration' {
         Should -Invoke Invoke-SetupAzure -Times 1 -Exactly -ParameterFilter { $Arguments[0] -eq 'role' -and $Arguments[2] -eq 'create' }
     }
 
-    It 'requires an approved root for Private Trust before making remote changes' {
-        $script:profileType = 'PrivateTrust'
-
-        { Invoke-ArtifactSigningSetup @setup } | Should -Throw '*PrivateTrust requires -TrustedRootCertificatePath*'
-
-        Should -Invoke Invoke-SetupGitHub -Times 0 -ParameterFilter { $Method -in 'PUT', 'POST', 'PATCH', 'DELETE' }
-        Should -Invoke Invoke-SetupGraph -Times 0
-    }
-
-    It 'configures approved Private Trust CAs without installing them locally' {
-        $script:profileType = 'PrivateTrust'
-        Mock Import-Certificate { throw 'Setup must not change local trust.' }
-
-        Invoke-ArtifactSigningSetup @setup -TrustedRootCertificatePath $setupRootPath `
-            -IntermediateCertificatePath @($setupIntermediatePath, $setupIntermediatePath)
-
-        $script:environmentVariables.ARTIFACT_SIGNING_PROFILE_TYPE | Should -BeExactly 'PrivateTrust'
-        $script:environmentVariables.ARTIFACT_SIGNING_ROOT_CERTIFICATE_BASE64 |
-            Should -BeExactly ([Convert]::ToBase64String($setupRootCa.RawData))
-        $encodedIntermediate = [Convert]::ToBase64String($setupIntermediateCa.RawData)
-        $script:environmentVariables.ARTIFACT_SIGNING_INTERMEDIATE_CERTIFICATES_BASE64 |
-            Should -BeExactly "$encodedIntermediate`n$encodedIntermediate"
-        Should -Invoke Import-Certificate -Times 0
-    }
-
-    It 'clears previously configured CAs when rerun for Public Trust without CA paths' {
-        Invoke-ArtifactSigningSetup @setup -TrustedRootCertificatePath $setupRootPath
-        $script:environmentVariables.ARTIFACT_SIGNING_INTERMEDIATE_CERTIFICATES_BASE64 = 'previous value'
+    It 'configures <ProfileType> without local certificate inputs or trust changes' -ForEach @(
+        @{ ProfileType = 'PublicTrust' },
+        @{ ProfileType = 'PrivateTrust' }
+    ) {
+        $script:profileType = $ProfileType
+        Mock Get-ArtifactSigningCaCertificate { throw 'Setup must not read local CA files.' }
+        Mock Import-ArtifactSigningTrust { throw 'Setup must not change local trust.' }
 
         Invoke-ArtifactSigningSetup @setup
 
-        $script:environmentVariables.ARTIFACT_SIGNING_PROFILE_TYPE | Should -BeExactly 'PublicTrust'
-        $script:environmentVariables.ARTIFACT_SIGNING_ROOT_CERTIFICATE_BASE64 | Should -BeNullOrEmpty
-        $script:environmentVariables.ARTIFACT_SIGNING_INTERMEDIATE_CERTIFICATES_BASE64 | Should -BeNullOrEmpty
-    }
-
-    It 'validates CA files even with WhatIf without making remote changes' {
-        { Invoke-ArtifactSigningSetup @setup -TrustedRootCertificatePath $setupRootPath `
-            -IntermediateCertificatePath $setupRootPath -WhatIf } | Should -Throw '*intermediate CA is a root*'
-
-        Should -Invoke Invoke-SetupGitHub -Times 0 -ParameterFilter { $Method -in 'PUT', 'POST', 'PATCH', 'DELETE' }
-        Should -Invoke Invoke-SetupGraph -Times 0
+        $script:repoVariables.ENABLE_ARTIFACT_SIGNING | Should -BeExactly 'true'
+        $script:environmentVariables.ARTIFACT_SIGNING_PROFILE_TYPE | Should -BeExactly $ProfileType
+        $script:environmentVariables.Keys | Should -Not -Contain 'ARTIFACT_SIGNING_ROOT_CERTIFICATE_BASE64'
+        Should -Invoke Get-ArtifactSigningCaCertificate -Times 0
+        Should -Invoke Import-ArtifactSigningTrust -Times 0
     }
 
     It 'makes no remote changes with WhatIf' {
@@ -532,35 +474,16 @@ Describe 'Setup API request encoding' {
     }
 }
 
-Describe 'GitHub Artifact Signing test workflow' -Skip:(-not $IsWindows) {
+Describe 'GitHub Artifact Signing setup and dispatch' {
     BeforeEach {
         $script:project = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
-        $null = New-Item -ItemType Directory -Path (Join-Path $project 'cache')
-        $script:version = '7.7.0'
-        $script:msiName = "PowerShell-$version-win-x64-unofficial.msi"
-        $zip = Join-Path $project "cache\PowerShell-$version-win-x64.zip"
-        Set-Content -LiteralPath $zip -Value 'test-only payload'
-        @{
-            powerShell = @{ version = $version; sha256 = (Get-FileHash -LiteralPath $zip).Hash }
-        } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $project 'dependencies.json')
+        $null = New-Item -ItemType Directory -Path $project
         $script:github = @{
             ProjectRoot = $project
             Repository = 'exampleorg/msi'
             ExpectedSignerSubject = 'CN=Example Organization'
             Confirm = $false
         }
-        $script:runInfo = [pscustomobject] @{
-            path = '.github/workflows/artifact-signing.yml'
-            event = 'workflow_dispatch'
-            head_branch = 'release/default'
-            head_repository = [pscustomobject] @{ full_name = 'ExampleOrg/msi' }
-            head_sha = ('a' * 40)
-            status = 'completed'
-            conclusion = 'success'
-            run_attempt = 2
-        }
-        $script:destination = Join-Path $project "out\github\ExampleOrg\msi\456\attempt-2\$msiName"
-        Mock Assert-GitHubSigningSource {}
         Mock Invoke-GitHubSigningApi {
             if ($Endpoint -eq 'repos/exampleorg/msi') {
                 return [pscustomobject] @{ full_name = 'ExampleOrg/msi'; default_branch = 'release/default' }
@@ -580,28 +503,9 @@ Describe 'GitHub Artifact Signing test workflow' -Skip:(-not $IsWindows) {
             if ($Endpoint -like '*/dispatches' -and $Method -eq 'POST') {
                 return [pscustomobject] @{ workflow_run_id = 456 }
             }
-            if ($Endpoint -eq 'repos/ExampleOrg/msi/actions/runs/456') { return $script:runInfo }
-            if ($Endpoint -like '*/456/attempts/2/jobs?per_page=100') {
-                return [pscustomobject] @{ jobs = @([pscustomobject] @{ name = 'sign'; conclusion = 'success' }) }
-            }
             throw "Unexpected GitHub helper request: $Method $Endpoint"
         }
-        Mock Invoke-NativeTool {
-            if ($Tool -eq 'gh' -and $ToolArguments[1] -eq 'download') {
-                $directory = $ToolArguments[([array]::IndexOf($ToolArguments, '--dir') + 1)]
-                Set-Content -LiteralPath (Join-Path $directory $script:msiName) -Value 'test-only signed MSI'
-                return
-            }
-            if ($Tool -eq 'gh' -and $ToolArguments[1] -eq 'view') {
-                $bytes = [Text.Encoding]::UTF8.GetBytes("test-only signed MSI$([Environment]::NewLine)")
-                $sha256 = [Security.Cryptography.SHA256]::Create()
-                try { $hash = [Convert]::ToHexString($sha256.ComputeHash($bytes)) }
-                finally { $sha256.Dispose() }
-                return "sign Verify signed MSI before publication Signed MSI SHA-256: $hash"
-            }
-            if ($ToolArguments[2] -eq (Join-Path $script:project 'verify.ps1')) { return }
-            throw "Unexpected GitHub helper command: $Tool $ToolArguments"
-        }
+        Mock Invoke-NativeTool { throw "Local MSI or Azure commands must not run: $Tool $ToolArguments" }
     }
 
     It 'allows the GitHub helper to set up solo use without supplying Reviewer' {
@@ -613,7 +517,7 @@ param($Repository, $CertificateProfileId, $ExpectedSignerSubject)
 
         $result = Invoke-GitHubArtifactSigning @github -Setup -CertificateProfileId '/subscriptions/test/profile'
 
-        $result.Repository | Should -BeExactly 'ExampleOrg/msi'
+        $result.Repository | Should -BeExactly 'exampleorg/msi'
         $result.ExpectedSignerSubject | Should -Be $github.ExpectedSignerSubject
         $result.PSObject.Properties.Name | Should -Not -Contain 'Reviewer'
     }
@@ -622,19 +526,17 @@ param($Repository, $CertificateProfileId, $ExpectedSignerSubject)
         @'
 [CmdletBinding(SupportsShouldProcess)]
 param($Repository, $CertificateProfileId, $ExpectedSignerSubject, $Reviewer,
-      $TrustedRootCertificatePath, $IntermediateCertificatePath, $ExpectedProfileEku,
-      $ApplicationClientId)
+      $ExpectedProfileEku, $ApplicationClientId)
 [pscustomobject] $PSBoundParameters
 '@ | Set-Content -LiteralPath (Join-Path $project 'setup-artifact-signing.ps1')
         $result = Invoke-GitHubArtifactSigning @github -Setup -WhatIf `
             -CertificateProfileId '/subscriptions/test/profile' -Reviewer @('another-reviewer') `
-            -TrustedRootCertificatePath 'approved-root.cer' -IntermediateCertificatePath @('approved-intermediate.cer')
+            -ExpectedProfileEku '1.3.6.1.4.1.311.97.123.456'
 
-        $result.Repository | Should -BeExactly 'ExampleOrg/msi'
+        $result.Repository | Should -BeExactly 'exampleorg/msi'
         $result.CertificateProfileId | Should -Be '/subscriptions/test/profile'
         $result.Reviewer | Should -Be @('another-reviewer')
-        $result.TrustedRootCertificatePath | Should -Be 'approved-root.cer'
-        $result.IntermediateCertificatePath | Should -Be @('approved-intermediate.cer')
+        $result.ExpectedProfileEku | Should -Be '1.3.6.1.4.1.311.97.123.456'
         [bool] $result.WhatIf | Should -BeTrue
         [bool] $result.Confirm | Should -BeFalse
         Should -Invoke Invoke-GitHubSigningApi -Times 0 -ParameterFilter { $Method -eq 'POST' }
@@ -657,6 +559,19 @@ param($Repository, $CertificateProfileId, $ExpectedSignerSubject, $Reviewer,
 
         $result | Should -BeNullOrEmpty
         Should -Invoke Invoke-GitHubSigningApi -Times 0 -ParameterFilter { $Method -eq 'POST' }
+    }
+
+    It 'triggers using only the repository without Azure commands or local build files' {
+        $github.Remove('ExpectedSignerSubject')
+
+        $result = Invoke-GitHubArtifactSigning @github -Run
+
+        $result.RunId | Should -Be 456
+        @(Get-ChildItem -LiteralPath $project -Force).Count | Should -Be 0
+        Should -Invoke Invoke-NativeTool -Times 0
+        Should -Invoke Invoke-GitHubSigningApi -Times 0 -ParameterFilter {
+            $Endpoint -like '*/environments/*/variables/*'
+        }
     }
 
     It 'requires setup to be enabled before dispatch' {
@@ -682,120 +597,90 @@ param($Repository, $CertificateProfileId, $ExpectedSignerSubject, $Reviewer,
         Should -Invoke Invoke-GitHubSigningApi -Times 1 -Exactly -ParameterFilter { $Method -eq 'POST' }
     }
 
-    It 'downloads one exact run and verifies its publisher, profile, payload, and logged hash before publishing' {
-        $result = Invoke-GitHubArtifactSigning @github -RunId 456 -ExpectedProfileEku '1.3.6.1.4.1.311.97.123.456'
+}
 
-        $result.MsiPath | Should -Be $destination
-        $result.MsiPath | Should -Exist
-        $result.RunAttempt | Should -Be 2
-        $result.Commit | Should -Be $script:runInfo.head_sha
-        $result.SHA256 | Should -Be (Get-FileHash -LiteralPath $destination).Hash
-        Should -Invoke Assert-GitHubSigningSource -Times 1 -Exactly -ParameterFilter {
-            $Ref -eq ('a' * 40)
-        }
-        Should -Invoke Invoke-NativeTool -Times 1 -Exactly -ParameterFilter {
-            $Tool -eq 'gh' -and $ToolArguments[1] -eq 'download' -and $ToolArguments[2] -eq '456' -and
-            $ToolArguments -contains 'powershell-msi-signed'
-        }
-        Should -Invoke Invoke-NativeTool -Times 1 -Exactly -ParameterFilter {
-            $ToolArguments[2] -eq (Join-Path $script:project 'verify.ps1') -and
-            $ToolArguments -contains '-ExpectedSignerSubject' -and $ToolArguments -contains $github.ExpectedSignerSubject -and
-            $ToolArguments -contains '-ExpectedProfileEku' -and $ToolArguments -contains '1.3.6.1.4.1.311.97.123.456'
-        }
-        Should -Invoke Invoke-NativeTool -Times 1 -Exactly -ParameterFilter {
-            $Tool -eq 'gh' -and $ToolArguments[1] -eq 'view' -and
-            $ToolArguments -contains '--attempt' -and $ToolArguments -contains '2'
-        }
-        @(Get-ChildItem -LiteralPath (Join-Path $project '.work\github-artifact-signing') -Directory).Count | Should -Be 0
+Describe 'Private Trust setup on the Windows runner' {
+    BeforeAll {
+        $workflow = Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\.github\workflows\artifact-signing.yml') -Raw
+        $match = [regex]::Match($workflow, '(?ms)^      - name: Configure Private Trust CA certificates on the runner\r?\n        if:.*?\r?\n        run: \|\r?\n(?<body>.*?)(?=^      - name:)')
+        if (-not $match.Success) { throw 'Private Trust runner step was not found.' }
+        $runnerTrust = [scriptblock]::Create(($match.Groups['body'].Value -replace '(?m)^ {10}', ''))
     }
 
-    It 'rejects <Property> = <Value> before downloading' -ForEach @(
-        @{ Property = 'status'; Value = 'waiting' },
-        @{ Property = 'conclusion'; Value = 'failure' },
-        @{ Property = 'path'; Value = '.github/workflows/build-unsigned-msi.yml' },
-        @{ Property = 'head_branch'; Value = 'feature' },
-        @{ Property = 'event'; Value = 'push' }
-    ) {
-        $script:runInfo.$Property = $Value
-
-        { Invoke-GitHubArtifactSigning @github -RunId 456 } | Should -Throw
-        Should -Invoke Invoke-NativeTool -Times 0
-    }
-
-    It 'rejects a skipped signing job even if the run conclusion is success' {
-        Mock Invoke-GitHubSigningApi {
-            [pscustomobject] @{ jobs = @([pscustomobject] @{ name = 'sign'; conclusion = 'skipped' }) }
-        } -ParameterFilter { $Endpoint -like '*/attempts/2/jobs?per_page=100' }
-
-        { Invoke-GitHubArtifactSigning @github -RunId 456 } | Should -Throw '*Skipped jobs do not prove signing works*'
-        Should -Invoke Invoke-NativeTool -Times 0
-    }
-
-    It 'requires the matching cached payload before downloading' {
-        Set-Content -LiteralPath (Join-Path $project "cache\PowerShell-$version-win-x64.zip") -Value 'wrong payload'
-
-        { Invoke-GitHubArtifactSigning @github -RunId 456 } | Should -Throw '*matching hash-verified ZIP*'
-        Should -Invoke Invoke-NativeTool -Times 0
-    }
-
-    It 'preserves a previous download if signature or payload verification fails with Force' {
-        $null = New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force
-        Set-Content -LiteralPath $destination -Value 'previous verified MSI'
-        $original = (Get-FileHash -LiteralPath $destination).Hash
-        Mock Invoke-NativeTool { throw 'MSI signer is not trusted' } -ParameterFilter {
-            $ToolArguments[2] -eq (Join-Path $script:project 'verify.ps1')
+    BeforeEach {
+        $runnerRoot = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
+        $null = New-Item -ItemType Directory -Path $runnerRoot
+        Copy-Item -LiteralPath (Join-Path $PSScriptRoot '..\dependencies.json') -Destination $runnerRoot
+        '# Runner signing helper fixture' | Set-Content -LiteralPath (Join-Path $runnerRoot 'signing.ps1')
+        Set-Content -LiteralPath (Join-Path $runnerRoot 'root.cer') -Value 'public root fixture'
+        Set-Content -LiteralPath (Join-Path $runnerRoot 'intermediate.cer') -Value 'public intermediate fixture'
+        @'
+param($SubscriptionId, $Endpoint, $AccountName, $CertificateProfileName,
+      $ExpectedSignerSubject, [switch] $DownloadCertificates)
+if (-not $DownloadCertificates) { throw 'Building or signing must not run in the CA step.' }
+if ($AccountName -ne 'account-name' -or $CertificateProfileName -ne 'profile-name' -or
+    $ExpectedSignerSubject -cne 'CN=Expected publisher') { throw 'Wrong profile download settings.' }
+[pscustomobject] @{
+    RootCertificatePath = Join-Path $PSScriptRoot 'root.cer'
+    IntermediateCertificatePath = @(Join-Path $PSScriptRoot 'intermediate.cer')
+}
+'@ | Set-Content -LiteralPath (Join-Path $runnerRoot 'local-artifact-signing.ps1')
+        $environment = @{
+            AZURE_SUBSCRIPTION_ID = '66666666-6666-6666-6666-666666666666'
+            ARTIFACT_SIGNING_ENDPOINT = 'https://neu.codesigning.azure.net/'
+            ARTIFACT_SIGNING_ACCOUNT_NAME = 'account-name'
+            ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME = 'profile-name'
+            EXPECTED_SIGNER_SUBJECT = 'CN=Expected publisher'
         }
-
-        { Invoke-GitHubArtifactSigning @github -RunId 456 -Force } | Should -Throw '*MSI signer is not trusted*'
-        (Get-FileHash -LiteralPath $destination).Hash | Should -Be $original
-        @(Get-ChildItem -LiteralPath (Join-Path $project '.work\github-artifact-signing') -Directory).Count | Should -Be 0
-    }
-
-    It 'rejects a mismatched run-log hash before publishing' {
-        Mock Invoke-NativeTool { "Signed MSI SHA-256: $('0' * 64)" } -ParameterFilter {
-            $Tool -eq 'gh' -and $ToolArguments[1] -eq 'view'
+        $previousEnvironment = @{}
+        foreach ($name in $environment.Keys) {
+            $previousEnvironment[$name] = [Environment]::GetEnvironmentVariable($name)
+            [Environment]::SetEnvironmentVariable($name, $environment[$name])
         }
-
-        { Invoke-GitHubArtifactSigning @github -RunId 456 } | Should -Throw '*SHA-256 does not match*'
-        $destination | Should -Not -Exist
+        Mock Get-Module { @() } -ParameterFilter { $Name -contains 'Az.ArtifactSigning' }
+        Mock Install-Module {} -ParameterFilter { $Name -contains 'Az.ArtifactSigning' }
+        Mock Import-Module {} -ParameterFilter { $Name -contains 'Az.ArtifactSigning' }
+        Mock Import-ArtifactSigningTrust {}
     }
 
-    It 'requires Force for an existing download and replaces it only after verification' {
-        $null = New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force
-        Set-Content -LiteralPath $destination -Value 'old download'
+    AfterEach {
+        foreach ($name in $previousEnvironment.Keys) {
+            [Environment]::SetEnvironmentVariable($name, $previousEnvironment[$name])
+        }
+    }
 
-        { Invoke-GitHubArtifactSigning @github -RunId 456 } | Should -Throw '*Use -Force*'
-        Should -Invoke Invoke-NativeTool -Times 0
-        $result = Invoke-GitHubArtifactSigning @github -RunId 456 -Force
+    It 'retrieves the configured profile CAs on the runner and imports them using the pinned module' {
+        Push-Location $runnerRoot
+        try { & $runnerTrust }
+        finally { Pop-Location }
 
-        $result.MsiPath | Should -Exist
-        Get-Content -LiteralPath $destination | Should -Be 'test-only signed MSI'
+        $version = (Get-Content -LiteralPath (Join-Path $runnerRoot 'dependencies.json') -Raw | ConvertFrom-Json).azArtifactSigning.version
+        Should -Invoke Install-Module -Times 1 -Exactly -ParameterFilter {
+            $Name -contains 'Az.ArtifactSigning' -and $RequiredVersion -eq $version
+        }
+        Should -Invoke Import-Module -Times 1 -Exactly -ParameterFilter {
+            $Name -contains 'Az.ArtifactSigning' -and $RequiredVersion -eq $version
+        }
+        $root = [Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path $runnerRoot 'root.cer')))
+        $intermediate = [Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path $runnerRoot 'intermediate.cer')))
+        Should -Invoke Import-ArtifactSigningTrust -Times 1 -Exactly -ParameterFilter {
+            $RootCertificateBase64 -ceq $root -and $IntermediateCertificatesBase64 -ceq $intermediate
+        }
+    }
+
+    It 'stops before importing trust if profile certificate retrieval fails' {
+        "throw 'Profile certificate retrieval failed.'" |
+            Set-Content -LiteralPath (Join-Path $runnerRoot 'local-artifact-signing.ps1')
+
+        Push-Location $runnerRoot
+        try { { & $runnerTrust } | Should -Throw '*Profile certificate retrieval failed*' }
+        finally { Pop-Location }
+
+        Should -Invoke Import-ArtifactSigningTrust -Times 0
     }
 }
 
-Describe 'GitHub signing source and dispatch requests' {
-    It 'accepts Windows line endings when the remote signing files otherwise match' {
-        $root = Split-Path -Parent $PSScriptRoot
-        Mock Invoke-GitHubSigningApi {
-            $relative = ($Endpoint -split '/contents/')[1].Split('?')[0].Replace('/', '\')
-            $text = (Get-Content -LiteralPath (Join-Path $root $relative) -Raw).Replace("`r`n", "`n")
-            [pscustomobject] @{ encoding = 'base64'; content = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($text)) }
-        }
-
-        Assert-GitHubSigningSource -ProjectRoot $root -Repository 'example/msi' -Ref 'main'
-        Should -Invoke Invoke-GitHubSigningApi -Times 5 -Exactly
-    }
-
-    It 'rejects unpublished workflow changes before any cloud writes' {
-        Mock Invoke-GitHubSigningApi {
-            [pscustomobject] @{ encoding = 'base64'; content = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('old workflow')) }
-        }
-
-        { Assert-GitHubSigningSource -ProjectRoot (Split-Path -Parent $PSScriptRoot) -Repository 'example/msi' -Ref 'main' } |
-            Should -Throw '*.github/workflows/artifact-signing.yml differs*'
-        Should -Invoke Invoke-GitHubSigningApi -Times 1 -Exactly
-    }
-
+Describe 'GitHub signing dispatch requests' {
     It 'requests a run-ID-returning API version and preserves a slash-containing branch ref' {
         Mock Invoke-NativeTool { '{"workflow_run_id":456}' }
 
