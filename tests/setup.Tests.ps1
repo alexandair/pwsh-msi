@@ -3,12 +3,13 @@
 
 <#
 .SYNOPSIS
-Runs mocked Artifact Signing setup regression tests through Pester.
+Runs mocked Artifact Signing setup and GitHub workflow tests through Pester.
 
 .DESCRIPTION
 Loads setup functions without executing the setup script. Tests environment
 protections, identity and federation reuse, profile-scoped RBAC, workflow
-variables, WhatIf, dispatch, failure handling, and API request safety.
+variables, WhatIf, dispatch, failure handling, and API request safety. Also tests
+the GitHub workflow helper's setup forwarding and downloaded-MSI acceptance.
 
 GitHub, Microsoft Graph, Azure, and native CLI calls are mocked. Does not need
 cloud credentials or change repository settings, identities, or Azure resources.
@@ -34,17 +35,19 @@ permissions, GitHub plan, or Artifact Signing enrollment are sufficient.
 
 BeforeAll {
     . (Join-Path $PSScriptRoot '..\signing.ps1')
-    $tokens = $null
-    $errors = $null
-    $ast = [Management.Automation.Language.Parser]::ParseFile(
-        (Join-Path $PSScriptRoot '..\setup-artifact-signing.ps1'), [ref] $tokens, [ref] $errors
-    )
-    if ($errors.Count) { throw ($errors.Message -join [Environment]::NewLine) }
-    foreach ($function in $ast.FindAll({
-        param($node)
-        $node -is [Management.Automation.Language.FunctionDefinitionAst]
-    }, $false)) {
-        . ([scriptblock]::Create($function.Extent.Text))
+    foreach ($scriptName in @('setup-artifact-signing.ps1', 'github-artifact-signing.ps1')) {
+        $tokens = $null
+        $errors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $PSScriptRoot "..\$scriptName"), [ref] $tokens, [ref] $errors
+        )
+        if ($errors.Count) { throw ($errors.Message -join [Environment]::NewLine) }
+        foreach ($function in $ast.FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst]
+        }, $false)) {
+            . ([scriptblock]::Create($function.Extent.Text))
+        }
     }
 
     $caKey = [Security.Cryptography.RSA]::Create(2048)
@@ -108,6 +111,7 @@ Describe 'Artifact Signing setup orchestration' {
         $script:existingEnvironments = @()
         $script:configuredWaitTimer = 0
         $script:ignoreWaitTimer = $false
+        $script:ignoreReviewerChanges = $false
         $script:profileType = 'PublicTrust'
         Mock Get-Command {}
         Mock Invoke-NativeTool {
@@ -167,20 +171,23 @@ Describe 'Artifact Signing setup orchestration' {
             }
             if ($Endpoint -like '*environments/artifact-signing') {
                 if ($methodValue -eq 'PUT') {
-                    $script:reviewers = $Body.reviewers
+                    if (-not $script:ignoreReviewerChanges) { $script:reviewers = $Body.reviewers }
                     if ($Body.ContainsKey('wait_timer') -and -not $script:ignoreWaitTimer) {
                         $script:configuredWaitTimer = $Body.wait_timer
                     }
                     return
                 }
                 return [pscustomobject] @{
-                    protection_rules = @([pscustomobject] @{
-                        type = 'required_reviewers'
-                        prevent_self_review = $script:protectionsSupported
-                        reviewers = @($script:reviewers | ForEach-Object {
-                            [pscustomobject] @{ type = $_.type; reviewer = [pscustomobject] @{ id = $_.id } }
-                        })
-                    }) + @(
+                    protection_rules = @(
+                        if ($script:reviewers.Count) {
+                            [pscustomobject] @{
+                                type = 'required_reviewers'
+                                prevent_self_review = $script:protectionsSupported
+                                reviewers = @($script:reviewers | ForEach-Object {
+                                    [pscustomobject] @{ type = $_.type; reviewer = [pscustomobject] @{ id = $_.id } }
+                                })
+                            }
+                        }
                         if ($script:configuredWaitTimer -gt 0) {
                             [pscustomobject] @{ type = 'wait_timer'; wait_timer = $script:configuredWaitTimer }
                         }
@@ -270,6 +277,47 @@ Describe 'Artifact Signing setup orchestration' {
             $Tool -eq 'az' -and $ToolArguments[2] -eq '--subscription' -and
             $ToolArguments[3] -eq '66666666-6666-6666-6666-666666666666'
         }
+    }
+
+    It 'supports solo setup without reviewer lookups or a required-reviewer protection feature' {
+        $setup.Remove('Reviewer')
+        $script:protectionsSupported = $false
+
+        Invoke-ArtifactSigningSetup @setup
+
+        $script:repoVariables.ENABLE_ARTIFACT_SIGNING | Should -BeExactly 'true'
+        $script:reviewers.Count | Should -Be 0
+        $script:policies.Count | Should -Be 1
+        $script:policies[0].name | Should -Be 'main'
+        Should -Invoke Invoke-SetupGitHub -Times 0 -ParameterFilter {
+            $Endpoint -like 'users/*' -or $Endpoint -like '*/collaborators/*'
+        }
+        Should -Invoke Invoke-SetupGitHub -Times 1 -Exactly -ParameterFilter {
+            $Method -eq 'PUT' -and $Body.reviewers.Count -eq 0 -and -not $Body.prevent_self_review
+        }
+    }
+
+    It 'removes existing required reviewers when rerun without Reviewer' {
+        Invoke-ArtifactSigningSetup @setup
+        $setup.Remove('Reviewer')
+
+        Invoke-ArtifactSigningSetup @setup
+
+        $script:repoVariables.ENABLE_ARTIFACT_SIGNING | Should -BeExactly 'true'
+        $script:reviewers.Count | Should -Be 0
+        Should -Invoke Invoke-SetupGraph -Times 1 -Exactly -ParameterFilter {
+            $Path -eq 'applications' -and $Method -eq 'POST'
+        }
+    }
+
+    It 'keeps signing disabled if GitHub does not remove a previous reviewer gate' {
+        Invoke-ArtifactSigningSetup @setup
+        $setup.Remove('Reviewer')
+        $script:ignoreReviewerChanges = $true
+
+        { Invoke-ArtifactSigningSetup @setup } | Should -Throw '*did not remove required-reviewer approval*'
+
+        $script:repoVariables.ENABLE_ARTIFACT_SIGNING | Should -BeExactly 'false'
     }
 
     It 'reruns without creating duplicate identities, federation or role assignments' {
@@ -480,6 +528,284 @@ Describe 'Setup API request encoding' {
 
         Should -Invoke Invoke-RestMethod -Times 1 -Exactly -ParameterFilter {
             $Uri -eq 'https://graph.microsoft.com/v1.0/applications'
+        }
+    }
+}
+
+Describe 'GitHub Artifact Signing test workflow' -Skip:(-not $IsWindows) {
+    BeforeEach {
+        $script:project = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
+        $null = New-Item -ItemType Directory -Path (Join-Path $project 'cache')
+        $script:version = '7.7.0'
+        $script:msiName = "PowerShell-$version-win-x64-unofficial.msi"
+        $zip = Join-Path $project "cache\PowerShell-$version-win-x64.zip"
+        Set-Content -LiteralPath $zip -Value 'test-only payload'
+        @{
+            powerShell = @{ version = $version; sha256 = (Get-FileHash -LiteralPath $zip).Hash }
+        } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $project 'dependencies.json')
+        $script:github = @{
+            ProjectRoot = $project
+            Repository = 'exampleorg/msi'
+            ExpectedSignerSubject = 'CN=Example Organization'
+            Confirm = $false
+        }
+        $script:runInfo = [pscustomobject] @{
+            path = '.github/workflows/artifact-signing.yml'
+            event = 'workflow_dispatch'
+            head_branch = 'release/default'
+            head_repository = [pscustomobject] @{ full_name = 'ExampleOrg/msi' }
+            head_sha = ('a' * 40)
+            status = 'completed'
+            conclusion = 'success'
+            run_attempt = 2
+        }
+        $script:destination = Join-Path $project "out\github\ExampleOrg\msi\456\attempt-2\$msiName"
+        Mock Assert-GitHubSigningSource {}
+        Mock Invoke-GitHubSigningApi {
+            if ($Endpoint -eq 'repos/exampleorg/msi') {
+                return [pscustomobject] @{ full_name = 'ExampleOrg/msi'; default_branch = 'release/default' }
+            }
+            if ($Endpoint -eq 'repos/ExampleOrg/msi/actions/workflows/artifact-signing.yml') {
+                return [pscustomobject] @{ state = 'active' }
+            }
+            if ($Endpoint -like '*/actions/variables/ENABLE_ARTIFACT_SIGNING') {
+                return [pscustomobject] @{ value = 'true' }
+            }
+            if ($Endpoint -like '*/variables/EXPECTED_SIGNER_SUBJECT') {
+                return [pscustomobject] @{ value = 'CN=Example Organization' }
+            }
+            if ($Endpoint -like '*/variables/EXPECTED_PROFILE_EKU') {
+                return [pscustomobject] @{ value = '1.3.6.1.4.1.311.97.123.456' }
+            }
+            if ($Endpoint -like '*/dispatches' -and $Method -eq 'POST') {
+                return [pscustomobject] @{ workflow_run_id = 456 }
+            }
+            if ($Endpoint -eq 'repos/ExampleOrg/msi/actions/runs/456') { return $script:runInfo }
+            if ($Endpoint -like '*/456/attempts/2/jobs?per_page=100') {
+                return [pscustomobject] @{ jobs = @([pscustomobject] @{ name = 'sign'; conclusion = 'success' }) }
+            }
+            throw "Unexpected GitHub helper request: $Method $Endpoint"
+        }
+        Mock Invoke-NativeTool {
+            if ($Tool -eq 'gh' -and $ToolArguments[1] -eq 'download') {
+                $directory = $ToolArguments[([array]::IndexOf($ToolArguments, '--dir') + 1)]
+                Set-Content -LiteralPath (Join-Path $directory $script:msiName) -Value 'test-only signed MSI'
+                return
+            }
+            if ($Tool -eq 'gh' -and $ToolArguments[1] -eq 'view') {
+                $bytes = [Text.Encoding]::UTF8.GetBytes("test-only signed MSI$([Environment]::NewLine)")
+                $sha256 = [Security.Cryptography.SHA256]::Create()
+                try { $hash = [Convert]::ToHexString($sha256.ComputeHash($bytes)) }
+                finally { $sha256.Dispose() }
+                return "sign Verify signed MSI before publication Signed MSI SHA-256: $hash"
+            }
+            if ($ToolArguments[2] -eq (Join-Path $script:project 'verify.ps1')) { return }
+            throw "Unexpected GitHub helper command: $Tool $ToolArguments"
+        }
+    }
+
+    It 'allows the GitHub helper to set up solo use without supplying Reviewer' {
+        @'
+[CmdletBinding(SupportsShouldProcess)]
+param($Repository, $CertificateProfileId, $ExpectedSignerSubject)
+[pscustomobject] $PSBoundParameters
+'@ | Set-Content -LiteralPath (Join-Path $project 'setup-artifact-signing.ps1')
+
+        $result = Invoke-GitHubArtifactSigning @github -Setup -CertificateProfileId '/subscriptions/test/profile'
+
+        $result.Repository | Should -BeExactly 'ExampleOrg/msi'
+        $result.ExpectedSignerSubject | Should -Be $github.ExpectedSignerSubject
+        $result.PSObject.Properties.Name | Should -Not -Contain 'Reviewer'
+    }
+
+    It 'forwards setup settings and WhatIf without dispatching or approving anything' {
+        @'
+[CmdletBinding(SupportsShouldProcess)]
+param($Repository, $CertificateProfileId, $ExpectedSignerSubject, $Reviewer,
+      $TrustedRootCertificatePath, $IntermediateCertificatePath, $ExpectedProfileEku,
+      $ApplicationClientId)
+[pscustomobject] $PSBoundParameters
+'@ | Set-Content -LiteralPath (Join-Path $project 'setup-artifact-signing.ps1')
+        $result = Invoke-GitHubArtifactSigning @github -Setup -WhatIf `
+            -CertificateProfileId '/subscriptions/test/profile' -Reviewer @('another-reviewer') `
+            -TrustedRootCertificatePath 'approved-root.cer' -IntermediateCertificatePath @('approved-intermediate.cer')
+
+        $result.Repository | Should -BeExactly 'ExampleOrg/msi'
+        $result.CertificateProfileId | Should -Be '/subscriptions/test/profile'
+        $result.Reviewer | Should -Be @('another-reviewer')
+        $result.TrustedRootCertificatePath | Should -Be 'approved-root.cer'
+        $result.IntermediateCertificatePath | Should -Be @('approved-intermediate.cer')
+        [bool] $result.WhatIf | Should -BeTrue
+        [bool] $result.Confirm | Should -BeFalse
+        Should -Invoke Invoke-GitHubSigningApi -Times 0 -ParameterFilter { $Method -eq 'POST' }
+        Should -Invoke Invoke-NativeTool -Times 0
+    }
+
+    It 'returns the dispatched run ID from the API rather than selecting the latest run' {
+        $result = Invoke-GitHubArtifactSigning @github -Run
+
+        $result.RunId | Should -Be 456
+        $result.RunUrl | Should -Be 'https://github.com/ExampleOrg/msi/actions/runs/456'
+        Should -Invoke Invoke-GitHubSigningApi -Times 1 -Exactly -ParameterFilter {
+            $Method -eq 'POST' -and $Field.Count -eq 1 -and $Field[0] -eq 'ref=refs/heads/release/default'
+        }
+        Should -Invoke Invoke-NativeTool -Times 0
+    }
+
+    It 'previews a dispatch without creating a run' {
+        $result = Invoke-GitHubArtifactSigning @github -Run -WhatIf
+
+        $result | Should -BeNullOrEmpty
+        Should -Invoke Invoke-GitHubSigningApi -Times 0 -ParameterFilter { $Method -eq 'POST' }
+    }
+
+    It 'requires setup to be enabled before dispatch' {
+        Mock Invoke-GitHubSigningApi { [pscustomobject] @{ value = 'false' } } -ParameterFilter {
+            $Endpoint -like '*/actions/variables/ENABLE_ARTIFACT_SIGNING'
+        }
+
+        { Invoke-GitHubArtifactSigning @github -Run } | Should -Throw '*Run this helper with -Setup first*'
+        Should -Invoke Invoke-GitHubSigningApi -Times 0 -ParameterFilter { $Method -eq 'POST' }
+    }
+
+    It 'rejects a configured signer that differs from the requested publisher' {
+        $github.ExpectedSignerSubject = 'CN=Different publisher'
+
+        { Invoke-GitHubArtifactSigning @github -Run } | Should -Throw '*EXPECTED_SIGNER_SUBJECT does not match*'
+        Should -Invoke Invoke-GitHubSigningApi -Times 0 -ParameterFilter { $Method -eq 'POST' }
+    }
+
+    It 'does not guess a run when dispatch returns no run ID' {
+        Mock Invoke-GitHubSigningApi {} -ParameterFilter { $Method -eq 'POST' }
+
+        { Invoke-GitHubArtifactSigning @github -Run } | Should -Throw '*Check https://github.com/ExampleOrg/msi/actions*'
+        Should -Invoke Invoke-GitHubSigningApi -Times 1 -Exactly -ParameterFilter { $Method -eq 'POST' }
+    }
+
+    It 'downloads one exact run and verifies its publisher, profile, payload, and logged hash before publishing' {
+        $result = Invoke-GitHubArtifactSigning @github -RunId 456 -ExpectedProfileEku '1.3.6.1.4.1.311.97.123.456'
+
+        $result.MsiPath | Should -Be $destination
+        $result.MsiPath | Should -Exist
+        $result.RunAttempt | Should -Be 2
+        $result.Commit | Should -Be $script:runInfo.head_sha
+        $result.SHA256 | Should -Be (Get-FileHash -LiteralPath $destination).Hash
+        Should -Invoke Assert-GitHubSigningSource -Times 1 -Exactly -ParameterFilter {
+            $Ref -eq ('a' * 40)
+        }
+        Should -Invoke Invoke-NativeTool -Times 1 -Exactly -ParameterFilter {
+            $Tool -eq 'gh' -and $ToolArguments[1] -eq 'download' -and $ToolArguments[2] -eq '456' -and
+            $ToolArguments -contains 'powershell-msi-signed'
+        }
+        Should -Invoke Invoke-NativeTool -Times 1 -Exactly -ParameterFilter {
+            $ToolArguments[2] -eq (Join-Path $script:project 'verify.ps1') -and
+            $ToolArguments -contains '-ExpectedSignerSubject' -and $ToolArguments -contains $github.ExpectedSignerSubject -and
+            $ToolArguments -contains '-ExpectedProfileEku' -and $ToolArguments -contains '1.3.6.1.4.1.311.97.123.456'
+        }
+        Should -Invoke Invoke-NativeTool -Times 1 -Exactly -ParameterFilter {
+            $Tool -eq 'gh' -and $ToolArguments[1] -eq 'view' -and
+            $ToolArguments -contains '--attempt' -and $ToolArguments -contains '2'
+        }
+        @(Get-ChildItem -LiteralPath (Join-Path $project '.work\github-artifact-signing') -Directory).Count | Should -Be 0
+    }
+
+    It 'rejects <Property> = <Value> before downloading' -ForEach @(
+        @{ Property = 'status'; Value = 'waiting' },
+        @{ Property = 'conclusion'; Value = 'failure' },
+        @{ Property = 'path'; Value = '.github/workflows/build-unsigned-msi.yml' },
+        @{ Property = 'head_branch'; Value = 'feature' },
+        @{ Property = 'event'; Value = 'push' }
+    ) {
+        $script:runInfo.$Property = $Value
+
+        { Invoke-GitHubArtifactSigning @github -RunId 456 } | Should -Throw
+        Should -Invoke Invoke-NativeTool -Times 0
+    }
+
+    It 'rejects a skipped signing job even if the run conclusion is success' {
+        Mock Invoke-GitHubSigningApi {
+            [pscustomobject] @{ jobs = @([pscustomobject] @{ name = 'sign'; conclusion = 'skipped' }) }
+        } -ParameterFilter { $Endpoint -like '*/attempts/2/jobs?per_page=100' }
+
+        { Invoke-GitHubArtifactSigning @github -RunId 456 } | Should -Throw '*Skipped jobs do not prove signing works*'
+        Should -Invoke Invoke-NativeTool -Times 0
+    }
+
+    It 'requires the matching cached payload before downloading' {
+        Set-Content -LiteralPath (Join-Path $project "cache\PowerShell-$version-win-x64.zip") -Value 'wrong payload'
+
+        { Invoke-GitHubArtifactSigning @github -RunId 456 } | Should -Throw '*matching hash-verified ZIP*'
+        Should -Invoke Invoke-NativeTool -Times 0
+    }
+
+    It 'preserves a previous download if signature or payload verification fails with Force' {
+        $null = New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force
+        Set-Content -LiteralPath $destination -Value 'previous verified MSI'
+        $original = (Get-FileHash -LiteralPath $destination).Hash
+        Mock Invoke-NativeTool { throw 'MSI signer is not trusted' } -ParameterFilter {
+            $ToolArguments[2] -eq (Join-Path $script:project 'verify.ps1')
+        }
+
+        { Invoke-GitHubArtifactSigning @github -RunId 456 -Force } | Should -Throw '*MSI signer is not trusted*'
+        (Get-FileHash -LiteralPath $destination).Hash | Should -Be $original
+        @(Get-ChildItem -LiteralPath (Join-Path $project '.work\github-artifact-signing') -Directory).Count | Should -Be 0
+    }
+
+    It 'rejects a mismatched run-log hash before publishing' {
+        Mock Invoke-NativeTool { "Signed MSI SHA-256: $('0' * 64)" } -ParameterFilter {
+            $Tool -eq 'gh' -and $ToolArguments[1] -eq 'view'
+        }
+
+        { Invoke-GitHubArtifactSigning @github -RunId 456 } | Should -Throw '*SHA-256 does not match*'
+        $destination | Should -Not -Exist
+    }
+
+    It 'requires Force for an existing download and replaces it only after verification' {
+        $null = New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force
+        Set-Content -LiteralPath $destination -Value 'old download'
+
+        { Invoke-GitHubArtifactSigning @github -RunId 456 } | Should -Throw '*Use -Force*'
+        Should -Invoke Invoke-NativeTool -Times 0
+        $result = Invoke-GitHubArtifactSigning @github -RunId 456 -Force
+
+        $result.MsiPath | Should -Exist
+        Get-Content -LiteralPath $destination | Should -Be 'test-only signed MSI'
+    }
+}
+
+Describe 'GitHub signing source and dispatch requests' {
+    It 'accepts Windows line endings when the remote signing files otherwise match' {
+        $root = Split-Path -Parent $PSScriptRoot
+        Mock Invoke-GitHubSigningApi {
+            $relative = ($Endpoint -split '/contents/')[1].Split('?')[0].Replace('/', '\')
+            $text = (Get-Content -LiteralPath (Join-Path $root $relative) -Raw).Replace("`r`n", "`n")
+            [pscustomobject] @{ encoding = 'base64'; content = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($text)) }
+        }
+
+        Assert-GitHubSigningSource -ProjectRoot $root -Repository 'example/msi' -Ref 'main'
+        Should -Invoke Invoke-GitHubSigningApi -Times 5 -Exactly
+    }
+
+    It 'rejects unpublished workflow changes before any cloud writes' {
+        Mock Invoke-GitHubSigningApi {
+            [pscustomobject] @{ encoding = 'base64'; content = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('old workflow')) }
+        }
+
+        { Assert-GitHubSigningSource -ProjectRoot (Split-Path -Parent $PSScriptRoot) -Repository 'example/msi' -Ref 'main' } |
+            Should -Throw '*.github/workflows/artifact-signing.yml differs*'
+        Should -Invoke Invoke-GitHubSigningApi -Times 1 -Exactly
+    }
+
+    It 'requests a run-ID-returning API version and preserves a slash-containing branch ref' {
+        Mock Invoke-NativeTool { '{"workflow_run_id":456}' }
+
+        $result = Invoke-GitHubSigningApi -Endpoint 'repos/example/msi/actions/workflows/artifact-signing.yml/dispatches' `
+            -Method POST -Field @('ref=refs/heads/release/default')
+
+        $result.workflow_run_id | Should -Be 456
+        Should -Invoke Invoke-NativeTool -Times 1 -Exactly -ParameterFilter {
+            $Tool -eq 'gh' -and $ToolArguments -contains 'X-GitHub-Api-Version: 2026-03-10' -and
+            $ToolArguments -contains 'POST' -and $ToolArguments -contains 'ref=refs/heads/release/default'
         }
     }
 }

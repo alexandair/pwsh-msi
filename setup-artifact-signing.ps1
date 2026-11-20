@@ -7,8 +7,9 @@ Configures the protected GitHub Actions Artifact Signing workflow using OIDC.
 .DESCRIPTION
 Uses Azure CLI, GitHub CLI, and Microsoft Graph to configure an existing
 repository and Artifact Signing certificate profile. Disables signing, sets
-required reviewers and default-branch-only deployment policies, prevents
-self-approval, and preserves an existing environment wait timer.
+default-branch-only deployment policies, and preserves an existing environment
+wait timer. Reviewer approval is optional; when configured, self-approval is
+prevented.
 
 Creates or reuses an Entra application and service principal, configures the
 repository's environment-scoped federated credential, assigns the signer role
@@ -32,9 +33,10 @@ profile. Determines the subscription, tenant, account, and regional endpoint.
 Complete, exact Windows SignerCertificate.Subject for the selected profile.
 
 .PARAMETER Reviewer
-One to six GitHub usernames or ORG/TEAM-SLUG values with repository read access.
-Teams must belong to the repository's organization. Replaces the dedicated
-artifact-signing environment's reviewer list.
+Optional GitHub usernames or ORG/TEAM-SLUG values with repository read access
+(up to six). Teams must belong to the repository's organization. Replaces the
+dedicated artifact-signing environment's reviewer list. Omit to require no
+reviewer approval, including when reconfiguring an existing environment.
 
 .PARAMETER ExpectedProfileEku
 Optional durable Artifact Signing profile identity OID beginning with
@@ -58,15 +60,14 @@ configured CA variables. PublicTrust normally needs neither CA parameter.
 
 .PARAMETER Dispatch
 Starts artifact-signing.yml on the default branch after verified setup.
-A designated reviewer must still approve it. A dispatch failure does not undo
-the successfully verified configuration.
+A designated reviewer must approve it only when Reviewer is supplied.
+A dispatch failure does not undo the successfully verified configuration.
 
 .EXAMPLE
 $setup = @{
     Repository = 'YOUR_ORG/YOUR_REPOSITORY'
     CertificateProfileId = '/subscriptions/<SUBSCRIPTION_ID>/resourceGroups/<RESOURCE_GROUP>/providers/Microsoft.CodeSigning/codeSigningAccounts/<ACCOUNT>/certificateProfiles/<PROFILE>'
     ExpectedSignerSubject = 'CN=Example Organization, O=Example Organization, C=US'
-    Reviewer = @('release-reviewer', 'YOUR_ORG/release-team')
 }
 .\setup-artifact-signing.ps1 @setup -WhatIf
 
@@ -78,6 +79,7 @@ prerequisite checks and previews the operation without changing cloud settings.
 
 Uses the setup hashtable from the previous example and asks for confirmation
 before configuring the signing environment, identity, permissions, and variables.
+No reviewer approval is required. Add -Reviewer when an approval gate is wanted.
 
 .EXAMPLE
 .\setup-artifact-signing.ps1 @setup -ApplicationClientId '11111111-1111-1111-1111-111111111111' -ExpectedProfileEku '1.3.6.1.4.1.311.97.123.456' -Dispatch
@@ -99,7 +101,8 @@ signing resources; manage Entra applications, service principals, and federated
 credentials; and assign the profile signer role.
 Supports GitHub.com, Azure public cloud, and default GitHub OIDC subjects only.
 Unsupported environment protections cause failure, not weakened protection.
-Private repositories generally require GitHub Enterprise for required reviewers.
+If reviewers are configured, private repositories generally require GitHub
+Enterprise for required-reviewer protection.
 Use -Confirm:$false only after reviewing the configuration. Do not run setup
 concurrently or while signing jobs are running. Azure permission propagation
 may require waiting before a rerun. Live setup and signing still need acceptance
@@ -123,10 +126,9 @@ param(
     [ValidateNotNullOrEmpty()]
     [string] $ExpectedSignerSubject,
 
-    [Parameter(Mandatory)]
-    [ValidateCount(1, 6)]
+    [ValidateCount(0, 6)]
     [ValidatePattern('^(?:[A-Za-z0-9-]+/)?[A-Za-z0-9-]+$')]
-    [string[]] $Reviewer,
+    [string[]] $Reviewer = @(),
 
     [ValidatePattern('^1\.3\.6\.1\.4\.1\.311\.97\.\d+(\.\d+)*$')]
     [string] $ExpectedProfileEku,
@@ -239,19 +241,26 @@ function Assert-SetupEnvironment {
     param(
         [Parameter(Mandatory)] [string] $Endpoint,
         [Parameter(Mandatory)] [string] $DefaultBranch,
-        [Parameter(Mandatory)] [object[]] $Reviewers,
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [object[]] $Reviewers,
         [int] $WaitTimer = 0
     )
 
     $environment = Invoke-SetupGitHub -Endpoint $Endpoint
     $rules = @($environment.protection_rules | Where-Object type -EQ 'required_reviewers')
-    if ($rules.Count -ne 1 -or -not $rules[0].prevent_self_review) {
-        throw 'GitHub did not enforce required reviewers and prevention of self-approval. Check your GitHub plan; signing must remain disabled.'
+    if ($Reviewers.Count -eq 0) {
+        if ($rules.Count -ne 0) {
+            throw 'GitHub did not remove required-reviewer approval as requested; signing must remain disabled.'
+        }
     }
-    $expected = @($Reviewers | ForEach-Object { "$($_.type):$($_.id)" } | Sort-Object -Unique)
-    $actual = @($rules[0].reviewers | ForEach-Object { "$($_.type):$($_.reviewer.id)" } | Sort-Object -Unique)
-    if ($expected.Count -ne $actual.Count -or (Compare-Object $expected $actual)) {
-        throw "GitHub environment reviewers do not match the requested reviewers. Expected: $($expected -join ', '); actual: $($actual -join ', ')."
+    else {
+        if ($rules.Count -ne 1 -or -not $rules[0].prevent_self_review) {
+            throw 'GitHub did not enforce required reviewers and prevention of self-approval. Check your GitHub plan; signing must remain disabled.'
+        }
+        $expected = @($Reviewers | ForEach-Object { "$($_.type):$($_.id)" } | Sort-Object -Unique)
+        $actual = @($rules[0].reviewers | ForEach-Object { "$($_.type):$($_.reviewer.id)" } | Sort-Object -Unique)
+        if ($expected.Count -ne $actual.Count -or (Compare-Object $expected $actual)) {
+            throw "GitHub environment reviewers do not match the requested reviewers. Expected: $($expected -join ', '); actual: $($actual -join ', ')."
+        }
     }
     if ($WaitTimer -gt 0) {
         $timers = @($environment.protection_rules | Where-Object type -EQ 'wait_timer')
@@ -276,7 +285,7 @@ function Invoke-ArtifactSigningSetup {
         [string] $Repository,
         [string] $CertificateProfileId,
         [string] $ExpectedSignerSubject,
-        [string[]] $Reviewer,
+        [string[]] $Reviewer = @(),
         [string] $ExpectedProfileEku,
         [string] $ApplicationClientId,
         [string] $TrustedRootCertificatePath,
@@ -355,9 +364,10 @@ function Invoke-ArtifactSigningSetup {
         }
     )
     $reviewers = @($reviewers | Sort-Object -Property type, id -Unique)
+    $approval = if ($reviewers.Count) { 'require reviewer approval' } else { 'remove reviewer approval' }
     if (-not $PSCmdlet.ShouldProcess(
         "$Repository and certificate profile $CertificateProfileId",
-        'Disable signing, replace environment reviewers/branch policies, configure Entra federation and profile RBAC, verify configuration, then enable signing'
+        "Disable signing, $approval, replace branch policies, configure Entra federation and profile RBAC, verify configuration, then enable signing"
     )) { return }
 
     try {
@@ -366,7 +376,7 @@ function Invoke-ArtifactSigningSetup {
             throw 'Could not confirm that signing is disabled.'
         }
         $environmentBody = @{
-            prevent_self_review = $true
+            prevent_self_review = ($reviewers.Count -gt 0)
             reviewers = $reviewers
             deployment_branch_policy = @{ protected_branches = $false; custom_branch_policies = $true }
         }
@@ -522,8 +532,9 @@ function Invoke-ArtifactSigningSetup {
     if ($Dispatch) {
         Invoke-NativeTool -Tool gh -ToolArguments @('workflow', 'run', 'artifact-signing.yml', '--repo', "github.com/$Repository", '--ref', $defaultBranch)
     }
-    Write-Host "Run and approve the signing workflow at https://github.com/$Repository/actions/workflows/artifact-signing.yml"
-    Write-Host 'Reviewer approval and live signing acceptance are still required; setup does not prove that signing succeeds.'
+    Write-Host "Run the signing workflow at https://github.com/$Repository/actions/workflows/artifact-signing.yml"
+    if ($reviewers.Count) { Write-Host 'A designated reviewer other than the initiator must approve the signing environment.' }
+    Write-Host 'Live signing acceptance is still required; setup does not prove that signing succeeds.'
 }
 
 Invoke-ArtifactSigningSetup @PSBoundParameters

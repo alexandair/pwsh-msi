@@ -532,6 +532,93 @@ without reusing the unsigned artifact or waiting for a successful CI run.
 It does not run Pester. Before upload, it checks the signed MSI's publisher,
 timestamp, optional profile EKU, installer identity, and payload.
 
+#### Test the GitHub workflow
+
+Use `github-artifact-signing.ps1` for setup, starting a run, and downloading and
+verifying its signed MSI. The helper reuses `setup-artifact-signing.ps1`; it does
+not create another signing account or certificate profile.
+
+First, commit and push the current changes, including the helper and tests, to
+your remote repository's default branch. Enable GitHub Actions if needed. The helper
+checks those files against the remote revision so you do not accidentally test
+an older workflow. It never commits or pushes for you.
+
+Setup needs the Azure and GitHub permissions described in
+[Automated local setup](#automated-local-setup). Permission to sign locally is
+not enough to create an Entra application and assign its signing role.
+No reviewer is required by default, so you can run this yourself.
+
+Authenticate if you have not already done so:
+
+```powershell
+gh auth login --hostname github.com
+az login --tenant '<TENANT_ID>'
+if ($LASTEXITCODE -ne 0) { throw 'Azure CLI login failed.' }
+```
+
+Set the repository, exact signer subject from your working local test, and setup
+options. Replace the placeholders with your existing profile:
+
+```powershell
+$github = @{
+    Repository = 'YOUR_ORG/YOUR_REPOSITORY'
+    ExpectedSignerSubject = '<EXACT_SIGNER_SUBJECT>'
+}
+$setup = @{
+    CertificateProfileId = '/subscriptions/<SUBSCRIPTION_ID>/resourceGroups/<RESOURCE_GROUP>/providers/Microsoft.CodeSigning/codeSigningAccounts/<ACCOUNT>/certificateProfiles/<PROFILE>'
+}
+
+# For Private Trust, supply the CA files already approved for your local test:
+$setup.TrustedRootCertificatePath = 'C:\Signing\profile-root.cer'
+# Only if needed:
+# $setup.IntermediateCertificatePath = @('C:\Signing\profile-intermediate.cer')
+
+.\github-artifact-signing.ps1 @github -Setup @setup -WhatIf
+.\github-artifact-signing.ps1 @github -Setup @setup
+```
+
+Omit the CA options for Public Trust unless the runner needs additional trust.
+Setup derives the regional endpoint from the Azure account. It configures the
+runner's trust, not your local certificate stores. The preview makes no cloud
+changes; the actual setup asks for confirmation.
+
+Start a run after setup succeeds:
+
+```powershell
+$run = .\github-artifact-signing.ps1 @github -Run
+$run
+```
+
+Open `RunUrl` and wait for the run to finish successfully. The helper returns
+the exact dispatched `RunId`, without guessing which run is latest.
+An approval step is needed only if you explicitly configured reviewers.
+
+Download and verify that run on your Windows machine:
+
+```powershell
+.\github-artifact-signing.ps1 @github -RunId $run.RunId
+```
+
+Keep the locally trusted CAs and cached PowerShell ZIP from your successful
+local test. The checkout's workflow, build script, verification script, signing
+helpers, and `dependencies.json` must match the run's revision. The helper rejects
+failed or incomplete runs and skipped signing jobs. It downloads only
+`powershell-msi-signed`, verifies the signature, exact signer, timestamp, installer,
+and full payload, and compares the MSI's SHA-256 with that run attempt's log.
+Add `ExpectedProfileEku` to `$github` before setup if you also want that check.
+
+Only a verified MSI is moved to
+`out\github\<OWNER>\<REPOSITORY>\<RUN_ID>\attempt-<ATTEMPT>`. Your locally built
+MSI in `out` is left alone. To download the same run attempt again:
+
+```powershell
+.\github-artifact-signing.ps1 @github -RunId $run.RunId -Force
+```
+
+In a new shell, recreate `$github` and supply the numeric run ID from the GitHub
+run URL instead of `$run.RunId`. To build and sign a new MSI, use `-Run` again;
+you do not need to repeat setup unless its configuration changes.
+
 #### Automated local setup
 
 Run `setup-artifact-signing.ps1` locally to configure the organization's
@@ -541,9 +628,10 @@ Authenticate `az` and `gh` first. It does not log in, enroll an organization,
 create a signing account/profile, or complete identity validation.
 
 Before running, you need an existing Public Trust or Private Trust code-signing
-profile, its full ARM resource ID, its exact expected certificate subject, and
-one to six reviewers. Reviewers can be GitHub usernames or `ORG/TEAM-SLUG`
-values, and must have repository read access.
+profile, its full ARM resource ID, and its exact expected certificate subject.
+Reviewers are optional. To require approval by another person, supply `-Reviewer`
+with up to six GitHub usernames or `ORG/TEAM-SLUG` values with repository read
+access. Without `-Reviewer`, setup configures no reviewer approval.
 For Private Trust, also obtain and approve the root CA `.cer` file and any
 required intermediate CA `.cer` files using the certificate steps above.
 
@@ -562,7 +650,6 @@ $setup = @{
     Repository = 'YOUR_ORG/YOUR_REPOSITORY'
     CertificateProfileId = '/subscriptions/<SUBSCRIPTION_ID>/resourceGroups/<RESOURCE_GROUP>/providers/Microsoft.CodeSigning/codeSigningAccounts/<ACCOUNT>/certificateProfiles/<PROFILE>'
     ExpectedSignerSubject = $expectedSignerSubject
-    Reviewer = @('release-reviewer', 'YOUR_ORG/release-team')
 }
 
 # For Private Trust, add the approved CA files before running setup:
@@ -592,13 +679,14 @@ Omitting CA paths on a later Public Trust setup clears the stored CA values.
 Only the CA certificates you supply are explicitly imported by the workflow.
 
 The script first disables signing, then configures the `artifact-signing`
-environment with your reviewers, prevention of self-approval, and a policy
-allowing only the default branch. It replaces the environment's reviewer list
-and removes other branch/tag policies, but keeps any existing wait timer.
-It checks that GitHub enforces those protections before creating an identity.
-If the repository's GitHub plan cannot enforce them, setup fails rather than
-weakening the rules. Private repositories generally require GitHub Enterprise
-for required-reviewer protection; check your plan before provisioning.
+environment to allow only the default branch. It replaces the environment's
+reviewer list; omitting `-Reviewer` removes any previously required reviewers.
+If reviewers are supplied, GitHub prevents self-approval. Setup removes other
+branch/tag policies but keeps any existing wait timer, and checks that GitHub
+enforces the requested settings before creating an identity.
+If the repository's GitHub plan cannot enforce them, setup fails. Private
+repositories generally require GitHub Enterprise for optional required-reviewer
+protection; that feature is not needed for solo runs without reviewers.
 
 Next it configures an Entra federated credential for issuer
 `https://token.actions.githubusercontent.com`, audience
@@ -619,8 +707,8 @@ and reports any failure to do so. It keeps created identities and permissions
 for a rerun. You may need to wait for Azure permissions to propagate before
 rerunning.
 
-Add `-Dispatch` to start the workflow on the default branch after setup. A
-designated reviewer must still approve it. The script does not bypass approval.
+Add `-Dispatch` to start the workflow on the default branch after setup.
+Reviewer approval is required only if reviewers were configured.
 If dispatch fails, the verified configuration stays enabled. Do not
 run setup concurrently or while signing jobs are running.
 Successful setup does not prove that signing works. The maintainer has not
