@@ -77,6 +77,7 @@ Describe 'Artifact Signing setup orchestration' {
         $script:roleAssignmentAllowed = $true
         $script:failFinalEnableRead = $false
         $script:customSubject = $false
+        $script:subjectPrefix = 'repo:ExampleOrg/msi'
         $script:existingEnvironments = @()
         $script:configuredWaitTimer = 0
         $script:ignoreWaitTimer = $false
@@ -102,7 +103,10 @@ Describe 'Artifact Signing setup orchestration' {
             }
             if ($Endpoint -like '*contents/.github/workflows/artifact-signing.yml*') { return @{} }
             if ($Endpoint -like '*oidc/customization/sub') {
-                return [pscustomobject] @{ use_default = -not $script:customSubject }
+                return [pscustomobject] @{
+                    use_default = -not $script:customSubject
+                    sub_claim_prefix = $script:subjectPrefix
+                }
             }
             if ($Endpoint -eq 'repos/ExampleOrg/msi/environments?per_page=100') {
                 return [pscustomobject] @{ environments = $script:existingEnvironments }
@@ -115,7 +119,12 @@ Describe 'Artifact Signing setup orchestration' {
                 $name = $Matches[1]
                 $variables = if ($Endpoint -like '*actions/variables*') { $script:repoVariables } else { $script:environmentVariables }
                 if ($methodValue -in 'POST', 'PATCH') {
+                    if ([string]::IsNullOrEmpty($Body.value)) { throw 'Variable value cannot be empty.' }
                     $variables[$Body.name] = $Body.value
+                    return
+                }
+                if ($methodValue -eq 'DELETE') {
+                    $variables.Remove($name)
                     return
                 }
                 if ($name) {
@@ -248,6 +257,43 @@ Describe 'Artifact Signing setup orchestration' {
         }
     }
 
+    It 'omits an unconfigured profile EKU without writing an empty GitHub variable' {
+        Invoke-ArtifactSigningSetup @setup
+
+        $script:repoVariables.ENABLE_ARTIFACT_SIGNING | Should -BeExactly 'true'
+        $script:environmentVariables.ContainsKey('EXPECTED_PROFILE_EKU') | Should -BeFalse
+        Should -Invoke Invoke-SetupGitHub -Times 0 -ParameterFilter {
+            $Endpoint -like '*/variables*' -and $Method -in 'POST', 'PATCH' -and
+            [string]::IsNullOrEmpty($Body.value)
+        }
+    }
+
+    It 'sets a supplied profile EKU and deletes it when omitted on rerun' {
+        $setup.ExpectedProfileEku = '1.3.6.1.4.1.311.97.123.456'
+        Invoke-ArtifactSigningSetup @setup
+        $script:environmentVariables.EXPECTED_PROFILE_EKU | Should -BeExactly $setup.ExpectedProfileEku
+        $setup.Remove('ExpectedProfileEku')
+
+        Invoke-ArtifactSigningSetup @setup
+
+        $script:repoVariables.ENABLE_ARTIFACT_SIGNING | Should -BeExactly 'true'
+        $script:environmentVariables.ContainsKey('EXPECTED_PROFILE_EKU') | Should -BeFalse
+        Should -Invoke Invoke-SetupGitHub -Times 1 -Exactly -ParameterFilter {
+            $Method -eq 'DELETE' -and $Endpoint -like '*/variables/EXPECTED_PROFILE_EKU'
+        }
+    }
+
+    It 'keeps signing disabled if the omitted profile EKU is not deleted' {
+        $script:environmentVariables.EXPECTED_PROFILE_EKU = '1.3.6.1.4.1.311.97.123.456'
+        Mock Invoke-SetupGitHub {} -ParameterFilter {
+            $Method -eq 'DELETE' -and $Endpoint -like '*/variables/EXPECTED_PROFILE_EKU'
+        }
+
+        { Invoke-ArtifactSigningSetup @setup } | Should -Throw '*GitHub variable verification failed: EXPECTED_PROFILE_EKU*'
+
+        $script:repoVariables.ENABLE_ARTIFACT_SIGNING | Should -BeExactly 'false'
+    }
+
     It 'supports solo setup without reviewer lookups or a required-reviewer protection feature' {
         $setup.Remove('Reviewer')
         $script:protectionsSupported = $false
@@ -372,6 +418,41 @@ Describe 'Artifact Signing setup orchestration' {
         Should -Invoke Invoke-SetupGraph -Times 1 -Exactly -ParameterFilter {
             $Path -like '*federatedIdentityCredentials/*' -and $Method -eq 'PATCH' -and -not $Body.ContainsKey('name')
         }
+    }
+
+    It 'uses the GitHub-reported immutable subject prefix when creating federation' {
+        $script:subjectPrefix = 'repo:ExampleOrg@456/msi@123'
+
+        Invoke-ArtifactSigningSetup @setup
+
+        $script:credentials[0].subject | Should -BeExactly 'repo:ExampleOrg@456/msi@123:environment:artifact-signing'
+        $script:repoVariables.ENABLE_ARTIFACT_SIGNING | Should -BeExactly 'true'
+    }
+
+    It 'repairs name-only federation when the repository adopts immutable subjects' {
+        Invoke-ArtifactSigningSetup @setup
+        $script:subjectPrefix = 'repo:ExampleOrg@456/msi@123'
+
+        Invoke-ArtifactSigningSetup @setup
+
+        $script:credentials[0].subject | Should -BeExactly 'repo:ExampleOrg@456/msi@123:environment:artifact-signing'
+        Should -Invoke Invoke-SetupGraph -Times 1 -Exactly -ParameterFilter {
+            $Path -like '*federatedIdentityCredentials/*' -and $Method -eq 'PATCH'
+        }
+        Should -Invoke Invoke-SetupGraph -Times 1 -Exactly -ParameterFilter {
+            $Path -eq 'applications' -and $Method -eq 'POST'
+        }
+    }
+
+    It 'rejects a missing OIDC subject prefix before making remote changes' {
+        Mock Invoke-SetupGitHub { [pscustomobject] @{ use_default = $true } } -ParameterFilter {
+            $Endpoint -like '*oidc/customization/sub'
+        }
+
+        { Invoke-ArtifactSigningSetup @setup } | Should -Throw '*GitHub did not return an OIDC subject prefix*'
+
+        Should -Invoke Invoke-SetupGitHub -Times 0 -ParameterFilter { $Method -in 'PUT', 'POST', 'PATCH', 'DELETE' }
+        Should -Invoke Invoke-SetupGraph -Times 0
     }
 
     It 'rejects ambiguous existing applications instead of granting permissions to the first match' {
@@ -664,7 +745,8 @@ if ($AccountName -ne 'account-name' -or $CertificateProfileName -ne 'profile-nam
         $root = [Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path $runnerRoot 'root.cer')))
         $intermediate = [Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path $runnerRoot 'intermediate.cer')))
         Should -Invoke Import-ArtifactSigningTrust -Times 1 -Exactly -ParameterFilter {
-            $RootCertificateBase64 -ceq $root -and $IntermediateCertificatesBase64 -ceq $intermediate
+            $RootCertificateBase64 -ceq $root -and $IntermediateCertificatesBase64 -ceq $intermediate -and
+            $StoreLocation -eq 'LocalMachine'
         }
     }
 

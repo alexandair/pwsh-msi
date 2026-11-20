@@ -123,7 +123,9 @@ function Get-ArtifactSigningCaCertificate {
 function Import-ArtifactSigningTrust {
     param(
         [string] $RootCertificateBase64,
-        [string] $IntermediateCertificatesBase64
+        [string] $IntermediateCertificatesBase64,
+        [ValidateSet('CurrentUser', 'LocalMachine')]
+        [string] $StoreLocation = 'CurrentUser'
     )
 
     $imports = @()
@@ -131,19 +133,20 @@ function Import-ArtifactSigningTrust {
         if ($RootCertificateBase64) {
             $imports += @{
                 Certificate = Get-ArtifactSigningCaCertificate -Base64Certificate $RootCertificateBase64 -Root
-                Store = 'Cert:\CurrentUser\Root'
+                Store = "Cert:\$StoreLocation\Root"
             }
         }
         foreach ($encoded in ($IntermediateCertificatesBase64 -split '\s+' | Where-Object { $_ })) {
             $imports += @{
                 Certificate = Get-ArtifactSigningCaCertificate -Base64Certificate $encoded
-                Store = 'Cert:\CurrentUser\CA'
+                Store = "Cert:\$StoreLocation\CA"
             }
         }
         foreach ($item in $imports) {
             $path = Join-Path ([IO.Path]::GetTempPath()) "artifact-signing-ca-$([guid]::NewGuid().ToString('N')).cer"
             try {
                 [IO.File]::WriteAllBytes($path, $item.Certificate.RawData)
+                Write-Host "Importing approved CA $($item.Certificate.Thumbprint) into $($item.Store)."
                 $null = Import-Certificate -FilePath $path -CertStoreLocation $item.Store -ErrorAction Stop
                 Write-Host "Imported approved CA $($item.Certificate.Thumbprint) into $($item.Store)."
             }

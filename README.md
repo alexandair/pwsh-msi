@@ -627,7 +627,8 @@ assigning the signer role at that profile. These are setup permissions; the
 workflow's signing identity receives only the profile signer assignment.
 The workflow file must already exist on the repository's default branch.
 This script supports GitHub.com, Azure public cloud, and the default GitHub
-OIDC subject format.
+OIDC subject formats (name-only and immutable-ID). Custom subject templates
+are not supported.
 
 ```powershell
 $setup = @{
@@ -652,10 +653,13 @@ account/profile names are derived from the specified Azure resource.
 For Private Trust, Azure login also enables an Azure PowerShell session on the
 runner. The workflow uses `Az.ArtifactSigning`, pinned in `dependencies.json`,
 to retrieve the selected profile's root and certificate chain. It checks the
-expected signer subject and imports the root into `Cert:\CurrentUser\Root` and
-intermediates into `Cert:\CurrentUser\CA` on that temporary runner. Public Trust
-normally uses the runner's existing Windows trust. This requires no local
-Azure PowerShell session or certificate-store changes.
+expected signer subject and imports the root into `Cert:\LocalMachine\Root` and
+intermediates into `Cert:\LocalMachine\CA` on that temporary runner. The hosted
+Windows runner has administrator privileges; machine-level imports avoid the
+interactive Windows trust prompt that current-user root imports can display.
+Local signing still uses current-user stores. Public Trust normally uses the
+runner's existing Windows trust. This requires no local Azure PowerShell session
+or certificate-store changes.
 
 The script first disables signing, then configures the `artifact-signing`
 environment to allow only the default branch. It replaces the environment's
@@ -669,8 +673,11 @@ protection; that feature is not needed for solo runs without reviewers.
 
 Next it configures an Entra federated credential for issuer
 `https://token.actions.githubusercontent.com`, audience
-`api://AzureADTokenExchange`, and subject
-`repo:OWNER/REPOSITORY:environment:artifact-signing`, then assigns
+`api://AzureADTokenExchange`, and the repository's GitHub-reported subject prefix
+followed by `:environment:artifact-signing`. Depending on the repository's OIDC
+settings, the prefix is `repo:OWNER/REPOSITORY` or
+`repo:OWNER@OWNER_ID/REPOSITORY@REPOSITORY_ID`. Rerunning setup updates an existing
+credential if the subject format has changed. Setup then assigns
 Artifact Signing Certificate Profile Signer at the exact profile scope.
 Existing unrelated application credentials and role assignments are not
 removed. Reusing an application leaves its existing permissions in place.
@@ -680,7 +687,9 @@ See Microsoft's
 It then writes and verifies the environment variables below, rechecks the
 protections, and enables the repository variable `ENABLE_ARTIFACT_SIGNING`.
 That flag stays at repository scope because the workflow checks it before
-entering its environment. An omitted profile EKU clears that optional variable.
+entering its environment. An omitted profile EKU removes the optional
+`EXPECTED_PROFILE_EKU` environment variable if it exists. GitHub does not accept
+empty variable values.
 If configuration fails after changes begin, the script tries to disable signing
 and reports any failure to do so. It keeps created identities and permissions
 for a rerun. You may need to wait for Azure permissions to propagate before

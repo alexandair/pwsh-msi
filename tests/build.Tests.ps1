@@ -233,6 +233,18 @@ Describe 'Explicit Artifact Signing CA trust' -Skip:(-not $IsWindows) {
         foreach ($path in $script:importPaths) { $path | Should -Not -Exist }
     }
 
+    It 'imports validated CAs into machine stores when explicitly requested for an unattended runner' {
+        Import-ArtifactSigningTrust -RootCertificateBase64 $rootBase64 `
+            -IntermediateCertificatesBase64 $intermediateBase64 -StoreLocation LocalMachine
+
+        $script:importedCertificates.Count | Should -Be 2
+        $script:importedCertificates[0].Thumbprint | Should -Be $rootCa.Thumbprint
+        $script:importedCertificates[0].Store | Should -BeExactly 'Cert:\LocalMachine\Root'
+        $script:importedCertificates[1].Thumbprint | Should -Be $intermediateCa.Thumbprint
+        $script:importedCertificates[1].Store | Should -BeExactly 'Cert:\LocalMachine\CA'
+        foreach ($path in $script:importPaths) { $path | Should -Not -Exist }
+    }
+
     It 'rejects a signing leaf as a root CA' {
         { Import-ArtifactSigningTrust -RootCertificateBase64 $leafBase64 } | Should -Throw '*not a CA certificate*'
 

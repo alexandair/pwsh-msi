@@ -40,7 +40,7 @@ reviewer approval, including when reconfiguring an existing environment.
 
 .PARAMETER ExpectedProfileEku
 Optional durable Artifact Signing profile identity OID beginning with
-1.3.6.1.4.1.311.97. Omitting it clears the optional workflow variable.
+1.3.6.1.4.1.311.97. Omitting it removes the optional environment variable.
 
 .PARAMETER ApplicationClientId
 Existing Entra application's client ID in the profile's subscription tenant.
@@ -84,7 +84,8 @@ Authenticate az and gh before running. Requires permission to manage repository
 environments, variables, OIDC settings, and reviewer metadata; read Azure
 signing resources; manage Entra applications, service principals, and federated
 credentials; and assign the profile signer role.
-Supports GitHub.com, Azure public cloud, and default GitHub OIDC subjects only.
+Supports GitHub.com, Azure public cloud, and default GitHub OIDC subjects
+(name-only or immutable-ID format). Custom subject templates are not supported.
 Unsupported environment protections cause failure, not weakened protection.
 If reviewers are configured, private repositories generally require GitHub
 Enterprise for required-reviewer protection.
@@ -137,7 +138,7 @@ function Invoke-SetupGitHub {
     )
 
     $arguments = @('api', $Endpoint, '--hostname', 'github.com', '--method', $Method,
-        '-H', 'Accept: application/vnd.github+json', '-H', 'X-GitHub-Api-Version: 2022-11-28')
+        '-H', 'Accept: application/vnd.github+json', '-H', 'X-GitHub-Api-Version: 2026-03-10')
     $file = $null
     try {
         if ($null -ne $Body) {
@@ -208,7 +209,13 @@ function Set-SetupVariable {
 
     $variables = @(Invoke-SetupGitHub -Endpoint "$Endpoint`?per_page=30" -Paginate |
         ForEach-Object { $_.variables })
-    if ($variables | Where-Object name -EQ $Name) {
+    $exists = $variables | Where-Object name -EQ $Name
+    if ([string]::IsNullOrEmpty($Value)) {
+        if ($exists) {
+            $null = Invoke-SetupGitHub -Endpoint "$Endpoint/$Name" -Method DELETE
+        }
+    }
+    elseif ($exists) {
         $null = Invoke-SetupGitHub -Endpoint "$Endpoint/$Name" -Method PATCH -Body @{ name = $Name; value = $Value }
     }
     else {
@@ -288,6 +295,9 @@ function Invoke-ArtifactSigningSetup {
     $null = Invoke-SetupGitHub -Endpoint "$repoEndpoint/contents/.github/workflows/artifact-signing.yml?ref=$([uri]::EscapeDataString($defaultBranch))"
     $oidc = Invoke-SetupGitHub -Endpoint "$repoEndpoint/actions/oidc/customization/sub"
     if (-not $oidc.use_default) { throw 'Custom GitHub OIDC subject templates are not supported by this setup script.' }
+    if (-not $oidc.PSObject.Properties['sub_claim_prefix'] -or [string]::IsNullOrWhiteSpace($oidc.sub_claim_prefix)) {
+        throw 'GitHub did not return an OIDC subject prefix. Cannot configure the federated credential safely.'
+    }
 
     $certificateProfile = Invoke-SetupAzure -SubscriptionId $subscriptionId -Arguments @(
         'resource', 'show', '--ids', $CertificateProfileId, '--api-version', '2025-10-13'
@@ -400,7 +410,7 @@ function Invoke-ArtifactSigningSetup {
         $federation = @{
             name = $credentialName
             issuer = 'https://token.actions.githubusercontent.com'
-            subject = "repo:${Repository}:environment:artifact-signing"
+            subject = "$($oidc.sub_claim_prefix):environment:artifact-signing"
             audiences = @('api://AzureADTokenExchange')
         }
         $credentialPath = "applications/$($app.id)/federatedIdentityCredentials"
@@ -461,7 +471,12 @@ function Invoke-ArtifactSigningSetup {
         $actual = @(Invoke-SetupGitHub -Endpoint "$environmentEndpoint/variables?per_page=30" -Paginate | ForEach-Object { $_.variables })
         foreach ($name in $variables.Keys) {
             $value = @($actual | Where-Object name -EQ $name)
-            if ($value.Count -ne 1 -or $value[0].value -cne $variables[$name]) { throw "GitHub variable verification failed: $name." }
+            if ([string]::IsNullOrEmpty($variables[$name])) {
+                if ($value.Count -ne 0) { throw "GitHub variable verification failed: $name." }
+            }
+            elseif ($value.Count -ne 1 -or $value[0].value -cne $variables[$name]) {
+                throw "GitHub variable verification failed: $name."
+            }
         }
         Assert-SetupEnvironment -Endpoint $environmentEndpoint -DefaultBranch $defaultBranch -Reviewers $reviewers -WaitTimer $waitTimer
         Set-SetupVariable -Endpoint $flagEndpoint -Name ENABLE_ARTIFACT_SIGNING -Value true

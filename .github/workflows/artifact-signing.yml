@@ -87,7 +87,8 @@ jobs:
           ) -join "`n"
           Import-ArtifactSigningTrust `
               -RootCertificateBase64 $root `
-              -IntermediateCertificatesBase64 $intermediates
+              -IntermediateCertificatesBase64 $intermediates `
+              -StoreLocation LocalMachine
 
       - name: Build unsigned MSI into staging
         id: build
