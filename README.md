@@ -36,10 +36,9 @@ The supplied signing workflow covers Artifact Signing only. For a local
 certificate or Key Vault, call `build.ps1` from your own Windows pipeline
 after configuring certificate access or Azure CLI authentication.
 
-A community tester has reported successful local Artifact Signing after
-installing the profile's root CA. The maintainer has not independently repeated
-that live test or run the GitHub signing workflow. Test your own configuration
-before relying on it; a passing CI run does not replace that check.
+Local Artifact Signing with a Private Trust profile has been tested successfully,
+including repeat builds after installing the CA certificates. The GitHub signing
+workflow has not yet been verified against the live service.
 
 ## Build
 
@@ -207,11 +206,10 @@ the same as for local signing.
 
 ### Microsoft Artifact Signing
 
-Local signing has been reported working against the live service by a community
-tester. The maintainer has not independently repeated that test. Automated
+Local Private Trust signing has been tested against the live service. Automated
 tests cover argument construction, identity checks, mandatory timestamping,
-cleanup, and failure handling with mocked signing. Complete the live acceptance
-check below with your own profile before distributing packages.
+cleanup, and failure handling with mocked signing. Test your own profile before
+distributing packages; the GitHub signing workflow still needs live acceptance.
 
 The organization supplies an Artifact Signing account, completed identity
 validation, and a Public Trust or Private Trust code-signing certificate profile.
@@ -220,6 +218,91 @@ Assign its signing identity the Artifact Signing Certificate Profile Signer role
 profile. Public Trust and Private Trust availability depend on Microsoft's
 onboarding requirements; a private profile is not a workaround for eligibility.
 The build machine and recipients must trust the resulting chain.
+
+#### Local download-and-sign workflow
+
+Use the shared `local-artifact-signing.ps1` helper to download certificates, build,
+sign, and verify. It has no built-in subscription, account, profile, or publisher.
+Run these commands from the repository root, using the Windows and runtime
+prerequisites described under [Tools and authentication](#tools-and-authentication).
+
+Set your account details:
+
+```powershell
+$signing = @{
+    SubscriptionId = '<SUBSCRIPTION_ID>'
+    Endpoint = '<YOUR_REGIONAL_CODESIGNING_ENDPOINT>'
+    AccountName = '<YOUR_ACCOUNT>'
+    CertificateProfileName = '<YOUR_PROFILE>'
+}
+```
+
+Replace `<YOUR_REGIONAL_CODESIGNING_ENDPOINT>` with your account's actual endpoint.
+For example, `https://neu.codesigning.azure.net/` is only for North Europe.
+For the first download, install the
+download module once and authenticate both Azure CLI and Azure PowerShell if
+you have not already done so:
+
+```powershell
+Install-Module Az.ArtifactSigning -Scope CurrentUser
+az login --tenant '<TENANT_ID>'
+if ($LASTEXITCODE -ne 0) { throw 'Azure CLI login failed.' }
+Connect-AzAccount -Tenant '<TENANT_ID>' -Subscription $signing.SubscriptionId
+
+$certificates = .\local-artifact-signing.ps1 @signing -DownloadCertificates
+$signing.ExpectedSignerSubject = $certificates.SignerSubject
+```
+
+The download does not install certificates. It prints CA file paths and SHA-256
+fingerprints, exports the intermediates, and returns the exact Windows signer
+subject. Have the profile owner verify the CA fingerprints before trusting them.
+
+For Private Trust, import the approved CA files and build the signed MSI:
+
+```powershell
+.\local-artifact-signing.ps1 @signing `
+    -TrustedRootCertificatePath $certificates.RootCertificatePath `
+    -IntermediateCertificatePath $certificates.IntermediateCertificatePath `
+    -Force
+```
+
+For Public Trust, or when the CAs are already installed for your Windows user,
+omit both CA path parameters:
+
+```powershell
+.\local-artifact-signing.ps1 @signing -Force
+```
+
+The helper creates the signed, timestamped MSI in `out`, then verifies its signature,
+expected publisher, timestamp, installer properties, and complete payload.
+`-Force` permits replacing an existing MSI after the build's signature checks
+succeed. Omit it if there is no existing output. It does not bypass trust checks.
+Signing uses Azure CLI only; Azure PowerShell is needed only for downloading
+certificates.
+
+To keep your settings across PowerShell sessions without committing them, save
+them under the ignored `.local` directory:
+
+```powershell
+New-Item -ItemType Directory -Path .\.local -Force | Out-Null
+$signing | ConvertTo-Json | Set-Content -LiteralPath .\.local\artifact-signing.json -Encoding utf8
+```
+
+For later runs, including when a signed MSI already exists:
+
+```powershell
+$signing = Get-Content -LiteralPath .\.local\artifact-signing.json -Raw | ConvertFrom-Json -AsHashtable
+.\local-artifact-signing.ps1 @signing -Force
+```
+
+There is no need to download or import CAs again for the same Windows user unless
+the CA chain changes. Routine signing-certificate rotation does not require CA
+reinstallation. To refresh existing certificate downloads, use
+`.\local-artifact-signing.ps1 @signing -DownloadCertificates -Force`; review any
+changed CA fingerprints before importing them.
+
+The sections below explain the equivalent manual steps. You do not need to
+repeat them after using the helper.
 
 #### Trust the profile's CA before building
 
@@ -258,7 +341,7 @@ Connect-AzAccount -Tenant '<TENANT_ID>' -Subscription '<SUBSCRIPTION_ID>'
 $profileParameters = @{
     AccountName = '<YOUR_ACCOUNT>'
     ProfileName = '<YOUR_PROFILE>'
-    EndpointUrl = '<YOUR_REGIONAL_ENDPOINT>'
+    EndpointUrl = '<YOUR_REGIONAL_CODESIGNING_ENDPOINT>'
 }
 
 Get-AzArtifactSigningCertificateRoot @profileParameters -Destination 'C:\Signing\profile-root.cer'
@@ -363,7 +446,7 @@ az account set --subscription '<SUBSCRIPTION_ID>'
 if ($LASTEXITCODE -ne 0) { throw 'Could not select the signing subscription.' }
 
 .\build.ps1 `
-    -ArtifactSigningEndpoint 'https://neu.codesigning.azure.net/' `
+    -ArtifactSigningEndpoint '<YOUR_REGIONAL_CODESIGNING_ENDPOINT>' `
     -ArtifactSigningAccountName '<YOUR_ACCOUNT>' `
     -ArtifactSigningCertificateProfileName '<YOUR_PROFILE>' `
     -ExpectedSignerSubject $expectedSignerSubject
@@ -576,8 +659,8 @@ organization's configured environment. Download the artifact and check
 `Get-AuthenticodeSignature` on a trusted Windows machine. Confirm `Valid`,
 the intended subject/profile EKU, a populated `TimeStamperCertificate`, and the
 logged SHA-256. Confirm the run's full payload verification succeeded.
-The maintainer has not exercised the live Artifact Signing service or its
-GitHub signing workflow. Local CI-equivalent checks do not replace this live test.
+The GitHub signing workflow has not yet been exercised against the live service.
+Successful local signing does not replace that workflow acceptance test.
 
 ### Downloads, releases, and privacy
 
@@ -632,6 +715,14 @@ and are covered by `LICENSE-PowerShell.txt`. The authoring is modified to label
 the package as unofficial, require Windows 10 version 1607/Server 2016 or later,
 remove Microsoft Update integration, report custom-action failures, and shorten
 an overlong tooltip.
+
+## Local development files
+
+The `.local` directory and everything inside it are ignored by Git. Keep personal
+scripts, `notes.md`, screenshots in `images`, and local signing configuration
+there. Create it with `New-Item -ItemType Directory -Path .\.local -Force` if it
+does not exist. Shared scripts such as `local-artifact-signing.ps1` stay at the
+repository root. Automated tests must not depend on files in `.local`.
 
 ## Signing tests
 

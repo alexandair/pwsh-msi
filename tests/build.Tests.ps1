@@ -308,6 +308,220 @@ Describe 'Explicit Artifact Signing CA trust' -Skip:(-not $IsWindows) {
     }
 }
 
+Describe 'Local Artifact Signing workflow' -Skip:(-not $IsWindows) {
+    BeforeAll {
+        $testScript = Join-Path $PSScriptRoot '..\local-artifact-signing.ps1'
+        $tokens = $null
+        $parseErrors = $null
+        $testAst = [Management.Automation.Language.Parser]::ParseFile($testScript, [ref] $tokens, [ref] $parseErrors)
+        if ($parseErrors.Count) { throw ($parseErrors.Message -join [Environment]::NewLine) }
+        $function = $testAst.Find({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -eq 'Invoke-LocalArtifactSigning'
+        }, $false)
+        . ([scriptblock]::Create($function.Extent.Text))
+        function Get-AzArtifactSigningCertificateRoot {
+            [CmdletBinding()]
+            param($AccountName, $ProfileName, $EndpointUrl, $Destination)
+        }
+        function Get-AzArtifactSigningCertificateChain {
+            [CmdletBinding()]
+            param($AccountName, $ProfileName, $EndpointUrl, $Destination)
+        }
+        function Set-AzContext {
+            [CmdletBinding()]
+            param($Subscription, $Tenant, $Scope)
+        }
+        $caRequest = [Security.Cryptography.X509Certificates.CertificateRequest]::new(
+            'CN=Acceptance script test root', $key, [Security.Cryptography.HashAlgorithmName]::SHA256,
+            [Security.Cryptography.RSASignaturePadding]::Pkcs1
+        )
+        $caRequest.CertificateExtensions.Add(
+            [Security.Cryptography.X509Certificates.X509BasicConstraintsExtension]::new($true, $false, 0, $true)
+        )
+        $acceptanceRoot = $caRequest.CreateSelfSigned(
+            [DateTimeOffset]::Now.AddMinutes(-5), [DateTimeOffset]::Now.AddDays(1)
+        )
+        $intermediateRequest = [Security.Cryptography.X509Certificates.CertificateRequest]::new(
+            'CN=Acceptance script test intermediate', $key, [Security.Cryptography.HashAlgorithmName]::SHA256,
+            [Security.Cryptography.RSASignaturePadding]::Pkcs1
+        )
+        $intermediateRequest.CertificateExtensions.Add(
+            [Security.Cryptography.X509Certificates.X509BasicConstraintsExtension]::new($true, $false, 0, $true)
+        )
+        $acceptanceIntermediate = $intermediateRequest.Create(
+            $acceptanceRoot, [DateTimeOffset]::Now.AddMinutes(-1), [DateTimeOffset]::Now.AddHours(1), [byte[]] @(7, 8, 9)
+        )
+    }
+
+    AfterAll {
+        $acceptanceIntermediate.Dispose()
+        $acceptanceRoot.Dispose()
+    }
+
+    BeforeEach {
+        $testParameters = @{
+            ProjectRoot = (Split-Path -Parent $PSScriptRoot)
+            SubscriptionId = '66666666-6666-6666-6666-666666666666'
+            Endpoint = 'https://neu.codesigning.azure.net/'
+            AccountName = 'example-account'
+            CertificateProfileName = 'example-profile'
+            CertificateDirectory = (Join-Path $TestDrive ([guid]::NewGuid().ToString('N')))
+            ExpectedSignerSubject = $publicCertificate.Subject
+        }
+        Mock Invoke-NativeTool {
+            if ($Tool -eq 'az') {
+                if ($ToolArguments[1] -eq 'set') { return }
+                if ($ToolArguments[1] -eq 'show') {
+                    return '{"tenantId":"11111111-1111-1111-1111-111111111111"}'
+                }
+            }
+            elseif ($ToolArguments[2] -match '\\(build|verify)\.ps1$') { return }
+            throw "Unexpected command: $Tool $ToolArguments"
+        }
+        Mock Set-AzContext {}
+        Mock Import-Module {} -ParameterFilter { $Name -contains 'Az.ArtifactSigning' }
+        Mock Get-AzArtifactSigningCertificateRoot {
+            [IO.File]::WriteAllBytes($Destination, $acceptanceRoot.RawData)
+        }
+        Mock Get-AzArtifactSigningCertificateChain {
+            $chain = [Security.Cryptography.X509Certificates.X509Certificate2Collection]::new()
+            $null = $chain.Add($publicCertificate)
+            $null = $chain.Add($acceptanceRoot)
+            $null = $chain.Add($acceptanceIntermediate)
+            [IO.File]::WriteAllBytes($Destination, $chain.Export(
+                [Security.Cryptography.X509Certificates.X509ContentType]::Pkcs7
+            ))
+        }
+        Mock Import-ArtifactSigningTrust {}
+        Mock Get-FileHash { [pscustomobject] @{ Hash = 'test-msi-hash' } } -ParameterFilter {
+            $LiteralPath -like '*.msi'
+        }
+    }
+
+    It 'downloads CA files and discovers the subject without trusting certificates or building' {
+        $download = Invoke-LocalArtifactSigning @testParameters -DownloadCertificates
+
+        $download.SignerSubject | Should -BeExactly $publicCertificate.Subject
+        $download.RootCertificatePath | Should -Exist
+        @($download.IntermediateCertificatePath).Count | Should -Be 1
+        $intermediate = Get-ArtifactSigningCaCertificate -Path $download.IntermediateCertificatePath[0]
+        try { $intermediate.Thumbprint | Should -Be $acceptanceIntermediate.Thumbprint }
+        finally { $intermediate.Dispose() }
+        Should -Invoke Import-ArtifactSigningTrust -Times 0
+        Should -Invoke Invoke-NativeTool -Times 0 -ParameterFilter { $Tool -ne 'az' }
+        Should -Invoke Set-AzContext -Times 1 -Exactly -ParameterFilter { $Scope -eq 'Process' }
+        Should -Invoke Get-AzArtifactSigningCertificateRoot -Times 1 -Exactly -ParameterFilter {
+            $AccountName -eq $testParameters.AccountName -and
+            $ProfileName -eq $testParameters.CertificateProfileName -and
+            $EndpointUrl -eq $testParameters.Endpoint
+        }
+    }
+
+    It 'explicitly loads the installed download module when command discovery cannot autoload it' {
+        Mock Get-Command { @() } -ParameterFilter {
+            $Name -contains 'Get-AzArtifactSigningCertificateRoot' -or
+                $Name -contains 'Get-AzArtifactSigningCertificateChain'
+        }
+
+        $download = Invoke-LocalArtifactSigning @testParameters -DownloadCertificates
+
+        $download.RootCertificatePath | Should -Exist
+        Should -Invoke Import-Module -Times 1 -Exactly -ParameterFilter { $Name -contains 'Az.ArtifactSigning' }
+    }
+
+    It 'reports the real module import failure instead of asking to reinstall an installed module' {
+        Mock Import-Module { throw 'Required assembly could not be loaded' } -ParameterFilter {
+            $Name -contains 'Az.ArtifactSigning'
+        }
+
+        { Invoke-LocalArtifactSigning @testParameters -DownloadCertificates } |
+            Should -Throw '*Required assembly could not be loaded*'
+
+        Should -Invoke Set-AzContext -Times 0
+        Should -Invoke Get-AzArtifactSigningCertificateRoot -Times 0
+    }
+
+    It 'does not overwrite downloaded certificates without Force' {
+        $null = Invoke-LocalArtifactSigning @testParameters -DownloadCertificates
+        $rootPath = Join-Path $testParameters.CertificateDirectory 'profile-root.cer'
+        $original = (Get-FileHash -LiteralPath $rootPath).Hash
+
+        { Invoke-LocalArtifactSigning @testParameters -DownloadCertificates } | Should -Throw '*already exists*'
+
+        (Get-FileHash -LiteralPath $rootPath).Hash | Should -Be $original
+        Should -Invoke Get-AzArtifactSigningCertificateRoot -Times 1 -Exactly
+    }
+
+    It 'uses only explicitly approved CA files and verifies the signed MSI after building' {
+        $download = Invoke-LocalArtifactSigning @testParameters -DownloadCertificates
+
+        $result = Invoke-LocalArtifactSigning @testParameters -Force `
+            -TrustedRootCertificatePath $download.RootCertificatePath `
+            -IntermediateCertificatePath $download.IntermediateCertificatePath
+
+        Should -Invoke Import-ArtifactSigningTrust -Times 1 -Exactly -ParameterFilter {
+            $RootCertificateBase64 -ceq [Convert]::ToBase64String($acceptanceRoot.RawData) -and
+            $IntermediateCertificatesBase64 -ceq [Convert]::ToBase64String($acceptanceIntermediate.RawData)
+        }
+        Should -Invoke Invoke-NativeTool -Times 1 -Exactly -ParameterFilter {
+            $ToolArguments -contains '-Force' -and $ToolArguments[2] -like '*\build.ps1' -and
+            $ToolArguments -contains $testParameters.AccountName -and
+            $ToolArguments -contains $testParameters.CertificateProfileName -and
+            $ToolArguments -contains $testParameters.Endpoint -and
+            $ToolArguments -contains $testParameters.ExpectedSignerSubject
+        }
+        Should -Invoke Invoke-NativeTool -Times 1 -Exactly -ParameterFilter {
+            $ToolArguments[2] -like '*\verify.ps1' -and $ToolArguments -contains '-ExpectedSignerSubject'
+        }
+        $result.MsiPath | Should -BeLike '*\out\*.msi'
+        $result.SHA256 | Should -Be 'test-msi-hash'
+    }
+
+    It 'does not change trust when CAs are already installed' {
+        $null = Invoke-LocalArtifactSigning @testParameters
+
+        Should -Invoke Import-ArtifactSigningTrust -Times 0
+        Should -Invoke Set-AzContext -Times 0
+        Should -Invoke Import-Module -Times 0 -ParameterFilter { $Name -contains 'Az.ArtifactSigning' }
+    }
+
+    It 'stops after a failed build rather than verifying or reporting an old MSI as successful' {
+        Mock Invoke-NativeTool { throw 'Signing failed' } -ParameterFilter {
+            $ToolArguments[2] -like '*\build.ps1'
+        }
+
+        { Invoke-LocalArtifactSigning @testParameters -Force } | Should -Throw '*Signing failed*'
+
+        Should -Invoke Invoke-NativeTool -Times 0 -ParameterFilter { $ToolArguments[2] -like '*\verify.ps1' }
+        Should -Invoke Get-FileHash -Times 0 -ParameterFilter { $LiteralPath -like '*.msi' }
+    }
+
+    It 'keeps different profiles certificates in separate default cache directories' {
+        $testParameters.Remove('CertificateDirectory')
+        $testParameters.ProjectRoot = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
+
+        $first = Invoke-LocalArtifactSigning @testParameters -DownloadCertificates
+        $testParameters.CertificateProfileName = 'another-profile'
+        $second = Invoke-LocalArtifactSigning @testParameters -DownloadCertificates
+
+        $first.RootCertificatePath | Should -Exist
+        $second.RootCertificatePath | Should -Exist
+        $first.RootCertificatePath | Should -Not -Be $second.RootCertificatePath
+    }
+
+    It 'checks an expected subject retained in configuration when downloading again' {
+        $testParameters.ExpectedSignerSubject = 'CN=Different publisher'
+
+        { Invoke-LocalArtifactSigning @testParameters -DownloadCertificates } |
+            Should -Throw '*Expected subject*Different publisher*'
+
+        Should -Invoke Import-ArtifactSigningTrust -Times 0
+        Should -Invoke Invoke-NativeTool -Times 0 -ParameterFilter { $Tool -ne 'az' }
+    }
+}
+
 Describe 'Signing input validation' -Skip:(-not $IsWindows) {
     It 'rejects a certificate without a private key before building' {
         { & $buildPath -SigningCertificate $publicCertificate -Force } |
